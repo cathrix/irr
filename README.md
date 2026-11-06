@@ -1,0 +1,83 @@
+# IRR Config Generation
+
+从 `AS-CATHRIX-CUST` 生成合资格 ASN 列表和 BIRD 前缀配置，并通过 ARIN 官方 IRR REST API 维护 `AS-CR`。
+
+## 配置
+
+编辑 `config/irr.json`：
+
+- `source_set`：顶层 AS-SET，默认 `AS-CATHRIX-CUST`。
+- `target_set`：ARIN 目标 AS-SET，默认 `AS-CR`。
+- `irr_host` / `irr_port`：IRRd 查询服务器，默认 `rr.ntt.net:43`。
+- `default_max_asns`：固定为 100。
+- `exceptions`：SET 名称映射到允许的 ASN 数量上限。已配置 `AS-MOEDOVE: 500`；超过 500 仍会被整个排除。删除这项即可恢复默认 100。
+- `arin`：创建目标对象时使用的 Org Handle、联系人和描述。默认 Org 为 `CN-578`，admin/tech POC 为 `CNOC24-ARIN`。
+
+配置使用 JSON，Python 标准库即可读取，无需安装 Python 依赖。
+
+## 两层解析规则
+
+1. 用 IRRd `!iAS-CATHRIX-CUST` 非递归查询顶层直接成员。
+2. 顶层直接 ASN 纳入结果；对每个直接子 AS-SET 调用 `bgpq4 -t -j -L 1`，只取得该子 SET 的直接 ASN。
+3. 子 SET 内的其他 AS-SET 不展开。每个子 SET 的直接 ASN 去重后计数，100 个允许，101 个排除，例外使用明确指定的上限。
+4. 合格 ASN 合并、去重、按数字排序。一个 ASN 即使来自被拒绝的 SET，若同时属于其他合格 SET，仍会保留。
+5. 对最终 ASN 列表分批调用 `bgpq4 -4/-6 -j` 查询 IRR route/route6 前缀。保留精确前缀，不使用 `-A` 聚合或自动放宽匹配范围。
+
+前缀数据来自 IRR 登记，不表示当前实际 BGP 宣告，也不额外进行 RPKI 验证。服务器使用其默认 IRR source 集合及优先级。
+
+## GitHub Actions
+
+在仓库 **Settings → Secrets and variables → Actions** 添加名为 `ARIN_API_KEY` 的 repository secret。该 Key 的 ARIN Online 账户必须有目标组织和对象的管理权限。
+
+- 每 6 小时（UTC 分钟 17）生成文件，并在默认分支上同步 ARIN。
+- 手动执行 **IRR Config Generation**：`upload` 默认关闭，勾选才同步；同步仅允许在默认分支执行。
+- push / pull request 执行测试和生成，不同步 ARIN。
+- 生成与上传分成两个 job，API Key 仅注入上传步骤。
+- 在 Actions 的 `irr-config` artifact 下载结果，保留 30 天；不自动提交生成文件。
+- 查询或生成失败时任务失败，阻止上传；全部 ASN 被排除时也阻止上传，避免意外清空目标。某一个地址族没有前缀时，允许输出空列表。
+- 超过数量限制的 SET 属于策略排除，记录到报告但不使任务失败；其他合格 SET 继续处理。
+
+## 本地运行
+
+安装 Python 3.9+ 和 bgpq4（需要支持 `-L`、JSON 输出）：
+
+```sh
+# Ubuntu
+sudo apt-get install bgpq4
+# macOS
+brew install bgpq4
+
+python3 -m unittest discover -s tests -v
+python3 scripts/irr.py generate
+```
+
+生成成功后，可用环境变量 `ARIN_API_KEY` 提供密钥并执行：
+
+```sh
+python3 scripts/irr.py upload
+```
+
+不要将密钥放进配置或提交到 Git。生成阶段无需 ARIN Key，只需能访问 IRRd TCP 43。
+
+## 输出
+
+`generated/` 中包含：
+
+- `asns.txt`：每行一个 `AS12345`。
+- `irr.conf`：`define ALL_PREFIXES_V4 = [...] ;` 与 `define ALL_PREFIXES_V6 = [...] ;`（实际输出以 `];` 结尾）。空列表为 `[]`，BIRD 语句带分号。
+- `rejected_sets.txt`：被排除的 SET、ASN 数量和上限；没有排除时为空文件。
+- `sets.json`：所有子 SET 的计数、上限和是否合格。
+- `manifest.json`：本次 ASN 与配置快照，供上传 job 使用。
+
+## ARIN API
+
+实现依据 [ARIN IRR RESTful API User Guide](https://www.arin.net/resources/manage/irr/irr-restful/#as-set-objects)：
+
+- `GET /rest/irr/as-set/AS-CR` 读取现有对象。
+- 存在时 `PUT /rest/irr/as-set/AS-CR` 更新。
+- 仅 GET 返回 404 时，通过 `POST /rest/irr/as-set?orgHandle=CN-578` 创建。
+- 使用 `Authorization: ApiKey <key>`，`Accept` 和 `Content-Type` 均为 `application/rpsl`。Key 不放在 URL。
+
+更新时保留现有描述、联系人等元数据，替换全部 `members`，移除 `mbrs-by-ref`，使成员明确等于生成的 ASN 列表。现有对象仍须满足 ARIN 的对象权限限制；公共查询看到空结果不代表有权限管理该对象。
+
+尚未使用真实 API Key 执行远程写入；离线测试覆盖创建及更新请求，首次启用请先手动生成并检查 artifact，再勾选 `upload`。

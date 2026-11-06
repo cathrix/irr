@@ -1,0 +1,67 @@
+name: IRR Config Generation
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: Synchronize the target AS-SET with ARIN
+        type: boolean
+        default: false
+  push:
+    paths: ['config/**', 'scripts/**', 'tests/**', '.github/workflows/irr-config.yml']
+  pull_request:
+    paths: ['config/**', 'scripts/**', 'tests/**', '.github/workflows/irr-config.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: irr-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run offline tests
+        run: python -m unittest discover -s tests -v
+      - name: Install bgpq4
+        run: sudo apt-get update && sudo apt-get install -y bgpq4
+      - name: Generate qualified ASNs and BIRD configuration
+        run: python scripts/irr.py generate
+      - name: Save generated files and rejection report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: irr-config
+          path: generated/
+          if-no-files-found: warn
+          retention-days: 30
+
+  publish:
+    needs: generate
+    if: >-
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: irr-config
+          path: generated/
+      - name: Synchronize ARIN AS-SET
+        env:
+          ARIN_API_KEY: ${{ secrets.ARIN_API_KEY }}
+        run: python scripts/irr.py upload

@@ -4,11 +4,13 @@
   "irr_host": "rr.ntt.net",
   "irr_port": 43,
   "default_max_asns": 100,
-  "exceptions": {"AS-MOEDOVE": 500},
+  "exceptions": {
+    "AS-MOEDOVE": 500
+  },
   "arin": {
     "org_handle": "CN-578",
     "admin_c": "CNOC24-ARIN",
     "tech_c": "CNOC24-ARIN",
-    "description": "Cathrix Network qualified customer ASNs"
+    "description": "Expanded from AS-CATHRIX-CUST"
   }
 }

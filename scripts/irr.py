@@ -102,7 +102,7 @@ def prefixes(cfg, asns, family):
     networks = set()
     # Exact prefixes: deliberately omit -A, which can generate prefix-length ranges.
     for start in range(0, len(asns), 200):
-        for entry in bgpq(cfg, [f'-{family}'], ['AS' + str(n) for n in asns[start:start+200]]):
+        for entry in bgpq(cfg, [f'-{family}'], ['AS' + str(n) for n in asns[start:start + 200]]):
             net = ipaddress.ip_network(entry['prefix'], strict=True)
             if net.version != family or entry.get('exact') is not True:
                 raise ValueError('Unexpected prefix or prefix range')
@@ -119,7 +119,7 @@ def bird_define(name, networks):
 def generate(cfg, output):
     output.mkdir(parents=True, exist_ok=True)
     asns, rejected, report = select_asns(cfg, direct_members(cfg),
-        lambda member: bgpq(cfg, ['-t', '-L', '1'], [member]))
+                                         lambda member: bgpq(cfg, ['-t', '-L', '1'], [member]))
     (output / 'rejected_sets.txt').write_text('\n'.join(rejected) + ('\n' if rejected else ''))
     (output / 'sets.json').write_text(json.dumps(report, indent=2) + '\n')
     if not asns:
@@ -133,8 +133,9 @@ def generate(cfg, output):
 
 def arin_request(method, path, key, body=None):
     request = urllib.request.Request('https://reg.arin.net/rest/irr/' + path,
-        data=body, method=method, headers={'Authorization': 'ApiKey ' + key,
-        'Accept': 'application/rpsl', 'Content-Type': 'application/rpsl'})
+                                     data=body, method=method, headers={'Authorization': 'ApiKey ' + key,
+                                                                        'Accept': 'application/rpsl',
+                                                                        'Content-Type': 'application/rpsl'})
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             return response.read().decode()
@@ -169,7 +170,9 @@ def upload(cfg, output):
             drop = field in {'members', 'mbrs-by-ref', 'created', 'last-modified'} or line.startswith('%')
             if not drop and line.strip():
                 lines.append(line)
-        if not any(line.lower().startswith('as-set:') and line.partition(':')[2].strip().upper() == cfg['target_set'] for line in lines):
+        if not any(
+                line.lower().startswith('as-set:') and line.partition(':')[2].strip().upper() == cfg['target_set'] for
+                line in lines):
             raise ValueError('Unexpected ARIN object')
     else:
         arin = cfg['arin']
@@ -181,7 +184,8 @@ def upload(cfg, output):
         lines = [f'{k}: {v}' for k, v in fields.items()]
     lines += [f'members: AS{n}' for n in asns]
     payload = ('\n'.join(lines) + '\n').encode()
-    path = 'as-set/' + name if current is not None else 'as-set?' + urllib.parse.urlencode({'orgHandle': cfg['arin']['org_handle']})
+    path = 'as-set/' + name if current is not None else 'as-set?' + urllib.parse.urlencode(
+        {'orgHandle': cfg['arin']['org_handle']})
     arin_request('PUT' if current is not None else 'POST', path, key, payload)
     print(f"Synchronized {cfg['target_set']} with {len(asns)} ASNs")
 

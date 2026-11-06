@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generate bounded IRR customer filters and optionally synchronize ARIN."""
 import argparse
+import datetime
 import ipaddress
 import json
 import os
@@ -116,6 +117,11 @@ def bird_define(name, networks):
     return f'define {name} = [\n  ' + ',\n  '.join(map(str, networks)) + '\n];\n'
 
 
+def irr_conf(v4, v6, generated_at):
+    header = f'# Generated at {generated_at}\n'
+    return header + bird_define('ALL_PREFIXES_V4', v4) + '\n' + bird_define('ALL_PREFIXES_V6', v6)
+
+
 def generate(cfg, output):
     output.mkdir(parents=True, exist_ok=True)
     asns, rejected, report = select_asns(cfg, direct_members(cfg),
@@ -126,7 +132,8 @@ def generate(cfg, output):
         raise RuntimeError('No qualified ASNs; refusing to generate or publish an empty set')
     v4, v6 = prefixes(cfg, asns, 4), prefixes(cfg, asns, 6)
     (output / 'asns.txt').write_text(''.join(f'AS{n}\n' for n in asns))
-    (output / 'irr.conf').write_text(bird_define('ALL_PREFIXES_V4', v4) + '\n' + bird_define('ALL_PREFIXES_V6', v6))
+    generated_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    (output / 'irr.conf').write_text(irr_conf(v4, v6, generated_at))
     (output / 'manifest.json').write_text(json.dumps({'config': cfg, 'asns': asns}, indent=2) + '\n')
     print(f'Generated {len(asns)} ASNs, {len(v4)} IPv4 and {len(v6)} IPv6 prefixes; rejected {len(rejected)} SETs')
 

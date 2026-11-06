@@ -29,11 +29,29 @@
 
 在仓库 **Settings → Secrets and variables → Actions** 添加名为 `ARIN_API_KEY` 的 repository secret。该 Key 的 ARIN Online 账户必须有目标组织和对象的管理权限。
 
-- 每 6 小时（UTC 分钟 17）生成文件，并在默认分支上同步 ARIN。
-- 手动执行 **IRR Config Generation**：`upload` 默认关闭，勾选才同步；同步仅允许在默认分支执行。
-- push / pull request 执行测试和生成，不同步 ARIN。
+- 每天 UTC 00:00 生成文件，在默认分支上同步 ARIN，并把 `irr.conf` 写入 `prod` 分支。
+- 手动执行 **IRR Config Generation**：行为与定时任务完全一致，同样同步 ARIN 并更新 `prod`；两者都仅允许在默认分支执行。
+- push / pull request 执行测试和生成，不同步 ARIN，也不写 `prod`。
 - 生成与上传分成两个 job，API Key 仅注入上传步骤。
-- 在 Actions 的 `irr-config` artifact 下载结果，保留 30 天；不自动提交生成文件。
+- 在 Actions 的 `irr-config` artifact 下载全部结果，保留 30 天。
+
+### prod 分支
+
+`prod` 分支只保存一个 `irr.conf`，由 Action 通过 GitHub Contents API 写入，不需要手动创建分支，也不需要配置额外的 token（使用内置 `GITHUB_TOKEN`，job 已声明 `contents: write`）。
+
+- 首次运行时 `prod` 不存在，Action 会自动创建分支并写入文件。
+- 之后每次生成都会覆盖 `prod` 上的 `irr.conf`，并提交一次。
+- 即使前缀列表没有变化也会提交，以便 `Generated at` 时间戳始终反映最近一次生成时间。因此 `prod` 每天会多一个提交，这是预期行为。
+- 提交信息带 `[skip ci]`，不会触发新的 workflow。
+
+消费方可以直接拉取 `prod` 分支的 `irr.conf`，例如：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/prod/irr.conf -o irr.conf
+```
+
+注意：`prod` 分支是生成物的唯一来源，**不要手动修改**，下一次运行会覆盖。需要调整内容请改 `config/irr.json` 后重新生成。
+
 - 查询或生成失败时任务失败，阻止上传；全部 ASN 被排除时也阻止上传，避免意外清空目标。某一个地址族没有前缀时，允许输出空列表。
 - 超过数量限制的 SET 属于策略排除，记录到报告但不使任务失败；其他合格 SET 继续处理。
 
@@ -80,4 +98,4 @@ python3 scripts/irr.py upload
 
 更新时保留现有描述、联系人等元数据，替换全部 `members`，移除 `mbrs-by-ref`，使成员明确等于生成的 ASN 列表。现有对象仍须满足 ARIN 的对象权限限制；公共查询看到空结果不代表有权限管理该对象。
 
-尚未使用真实 API Key 执行远程写入；离线测试覆盖创建及更新请求，首次启用请先手动生成并检查 artifact，再勾选 `upload`。
+尚未使用真实 API Key 执行远程写入；离线测试覆盖创建及更新请求。首次上线前，建议先手动执行一次 workflow，确认 `irr-config` artifact 中的 `asns.txt` 和 `sets.json` 符合预期。

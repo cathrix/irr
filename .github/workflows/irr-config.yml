@@ -2,13 +2,8 @@ name: IRR Config Generation
 
 on:
   schedule:
-    - cron: '17 */6 * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
-    inputs:
-      upload:
-        description: Synchronize the target AS-SET with ARIN
-        type: boolean
-        default: false
   push:
     paths: [ 'config/**', 'scripts/**', 'tests/**', '.github/workflows/irr-config.yml' ]
   pull_request:
@@ -25,6 +20,8 @@ jobs:
   generate:
     runs-on: ubuntu-26.04
     timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -36,6 +33,25 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y bgpq4
       - name: Generate qualified ASNs and BIRD configuration
         run: python scripts/irr.py generate
+      - name: Publish irr.conf to prod branch
+        if: >-
+          github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          api="repos/${GITHUB_REPOSITORY}"
+          # Use the API so the prod branch never needs to be pushed to directly.
+          # Always commit: the header timestamp must advance on every run, even when
+          # the prefix list is unchanged.
+          remote_sha=$(gh api "${api}/contents/irr.conf?ref=prod" --jq .sha 2>/dev/null || true)
+          args=(-f message="chore: update irr.conf [skip ci]" -f content="$(base64 -w0 generated/irr.conf)" -f branch=prod)
+          if [ -n "$remote_sha" ]; then
+            args+=(-f sha="$remote_sha")
+          fi
+          gh api --method PUT "${api}/contents/irr.conf" "${args[@]}"
+          echo "Published irr.conf to prod"
       - name: Save generated files and rejection report
         if: always()
         uses: actions/upload-artifact@v7
@@ -49,7 +65,7 @@ jobs:
     needs: generate
     if: >-
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload))
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:

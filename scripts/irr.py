@@ -17,6 +17,7 @@ import xml.etree.ElementTree as ET
 
 ASN = re.compile(r"AS([0-9]+)$")
 SET = re.compile(r"(?:AS[0-9]+:|AS-[A-Z0-9_-]+:)*AS-[A-Z0-9_-]+$")
+DEFAULT_MAX_ASNS = 100
 
 
 def validate_set(value):
@@ -25,7 +26,10 @@ def validate_set(value):
     return value
 
 
-DEFAULT_MAX_ASNS = 100
+def validate_asns(values):
+    if any(type(n) is not int or not 0 < n < 4294967295 for n in values):
+        raise ValueError('Invalid ASN')
+    return values
 
 
 def load_config(path):
@@ -34,7 +38,6 @@ def load_config(path):
     validate_set(cfg['customer_set'])
     validate_set(cfg['target_set'])
     default = cfg.get('default_max_asns', DEFAULT_MAX_ASNS)
-    # bool is an int subclass, so reject it explicitly before the range check.
     if isinstance(default, bool) or not isinstance(default, int) or default <= 0:
         raise ValueError('default_max_asns must be a positive integer')
     exceptions = cfg.get('exceptions', {})
@@ -48,14 +51,11 @@ def load_config(path):
 
 
 def asn_limit(cfg, set_name):
-    """Per-set cap: an explicit exception wins, otherwise the configured default."""
     return cfg.get('exceptions', {}).get(set_name, cfg.get('default_max_asns', DEFAULT_MAX_ASNS))
 
 
 def direct_members(cfg, set_name):
-    # IRRd A<n> counts BYTES, not lines. !! enables multiple commands and has no reply.
     with socket.create_connection((cfg['irr_host'], cfg.get('irr_port', 43)), timeout=30) as sock:
-        sock.settimeout(30)
         sock.sendall(('!!\n!i' + set_name + '\n').encode('ascii'))
         with sock.makefile('rb') as stream:
             status = stream.readline().strip()
@@ -65,6 +65,7 @@ def direct_members(cfg, set_name):
                 return []
             if not status.startswith(b'A') or not status[1:].isdigit():
                 raise RuntimeError('Unexpected IRRd response')
+            # IRRd replies "A<bytes>" followed by exactly that many bytes of data.
             size = int(status[1:])
             if size > 16 * 1024 * 1024:
                 raise RuntimeError('IRRd response too large')
@@ -78,32 +79,27 @@ def bgpq(cfg, flags, objects):
     command = ['bgpq4', '-h', f"{cfg['irr_host']}:{cfg.get('irr_port', 43)}",
                '-j', '-l', 'RESULT', *flags, *objects]
     result = subprocess.run(command, capture_output=True, text=True, timeout=180, check=True)
-    # Treat warnings as failures rather than publishing a potentially partial result.
     if result.stderr.strip():
         raise RuntimeError('bgpq4 reported: ' + result.stderr.strip())
-    values = json.loads(result.stdout)['RESULT']
+    try:
+        values = json.loads(result.stdout)['RESULT']
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError(f'bgpq4 returned unexpected output for {objects}: {exc}') from None
     if not isinstance(values, list):
         raise ValueError('Invalid bgpq4 response')
     return values
 
 
 def select_asns(cfg, members, expand):
-    """Return accepted ASNs plus the excluded AS-SETs and the count of every child set."""
     accepted, excluded, counts = set(), [], []
     for member in sorted(set(members)):
         match = ASN.fullmatch(member)
         if match:
-            number = int(match[1])
-            if not 0 < number < 4294967295:
-                raise ValueError('Invalid ASN')
-            accepted.add(number)
+            accepted.add(validate_asns([int(match[1])])[0])
             continue
         validate_set(member)
-        # -L 1 includes only the child SET's direct ASNs, never its nested SETs.
-        values = expand(member)
-        if any(type(n) is not int or not 0 < n < 4294967295 for n in values):
-            raise ValueError('Invalid ASN response')
-        values = set(values)
+        # Only the child SET's own ASNs are counted; nested SETs are not expanded.
+        values = set(validate_asns(expand(member)))
         limit = asn_limit(cfg, member)
         counts.append((member, len(values), limit))
         if len(values) <= limit:
@@ -114,30 +110,22 @@ def select_asns(cfg, members, expand):
 
 
 def own_asns(cfg):
-    """ASNs of AS-CATHRIX excluding the target set, which only holds flattened customers."""
     asns = set()
     for member in direct_members(cfg, cfg['full_set']):
         match = ASN.fullmatch(member)
         if match:
-            number = int(match[1])
-            if not 0 < number < 4294967295:
-                raise ValueError('Invalid ASN')
-            asns.add(number)
+            asns.add(validate_asns([int(match[1])])[0])
         elif member == cfg['target_set']:
             continue
         else:
-            # Own sets are expanded fully: their nested sets are ours, not customers.
-            values = bgpq(cfg, ['-t'], [member])
-            if any(type(n) is not int or not 0 < n < 4294967295 for n in values):
-                raise ValueError('Invalid ASN response')
-            asns.update(values)
+            asns.update(validate_asns(bgpq(cfg, ['-t'], [member])))
     return asns
 
 
 def prefixes(cfg, asns, family):
     networks = set()
-    # Exact prefixes: deliberately omit -A, which can generate prefix-length ranges.
     asns = sorted(asns)
+    # Exact prefixes only; -A would emit prefix-length ranges.
     for start in range(0, len(asns), 200):
         for entry in bgpq(cfg, [f'-{family}'], ['AS' + str(n) for n in asns[start:start + 200]]):
             net = ipaddress.ip_network(entry['prefix'], strict=True)
@@ -167,8 +155,7 @@ def delta(current, previous):
     return f'+{change}' if change >= 0 else str(change)
 
 
-def result_report(generated_at, all_asns, v4, v6, excluded, previous=None):
-    """previous holds the last run's counts, or None when there is nothing to compare."""
+def result_report(generated_at, all_asns, v4, v6, excluded, previous):
     previous = previous or {}
     lines = [f'Generated at {generated_at}', '',
              f'ASNs: {len(all_asns)} ({delta(len(all_asns), previous.get("asns"))})',
@@ -180,7 +167,6 @@ def result_report(generated_at, all_asns, v4, v6, excluded, previous=None):
 
 
 def previous_counts(path):
-    """Read the counts of the last run from an existing result.txt, if any."""
     try:
         text = path.read_text()
     except FileNotFoundError:
@@ -197,8 +183,8 @@ def previous_counts(path):
 def generate(cfg, output):
     output.mkdir(parents=True, exist_ok=True)
     previous = previous_counts(output / 'result.txt')
-    customers, excluded, counts = select_asns(cfg, direct_members(cfg, cfg['customer_set']),
-                                              lambda member: bgpq(cfg, ['-t', '-L', '1'], [member]))
+    customers, excluded, _ = select_asns(cfg, direct_members(cfg, cfg['customer_set']),
+                                         lambda member: bgpq(cfg, ['-t', '-L', '1'], [member]))
     if not customers:
         raise RuntimeError('No qualified customer ASNs; refusing to generate or publish an empty set')
     own = own_asns(cfg)
@@ -210,16 +196,14 @@ def generate(cfg, output):
         result_report(generated_at, all_asns, v4, v6, excluded, previous))
     print(f'Generated {len(all_asns)} ASNs, {len(v4)} IPv4 and {len(v6)} IPv6 prefixes; '
           f'excluded {len(excluded)} AS-SETs')
-    return {'customers': customers, 'own': own, 'all': all_asns}
+    return {'customers': customers, 'own': own}
 
 
 def arin_error(exc):
-    """Extract ARIN's error code/message so failures are diagnosable without leaking secrets."""
     try:
         body = exc.read().decode('utf-8', 'replace')
-    except Exception:
+    except (OSError, ValueError):
         return f'HTTP {exc.code}'
-    # RPSL errors look like "code:   E_X\nmessage:  text"; XML errors use <code>/<message>.
     code = re.search(r'code\s*:?\s*>?\s*([A-Z][A-Z_]+)', body)
     message = re.search(r'message\s*:?\s*>?\s*([^<\n]+)', body)
     parts = [f'HTTP {exc.code}']
@@ -231,11 +215,11 @@ def arin_error(exc):
 
 
 ARIN_NS = 'http://www.arin.net/regrws/core/v1'
+POC_LABELS = {'AD': 'Admin', 'T': 'Tech', 'R': 'Routing'}
 
 
 def arin_request(method, path, key, body=None):
-    # ARIN only accepts application/xml; application/rpsl is rejected with
-    # E_BAD_REQUEST "No match for accept header".
+    # ARIN only serves application/xml.
     headers = {'Authorization': 'ApiKey ' + key, 'Accept': 'application/xml'}
     if body is not None:
         headers['Content-Type'] = 'application/xml'
@@ -251,12 +235,14 @@ def arin_request(method, path, key, body=None):
 
 
 def parse_as_set(xml_text, expected_name):
-    """Read the metadata we must preserve from an existing as-set XML document."""
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as exc:
         raise ValueError(f'ARIN returned unparsable XML: {exc}') from None
-    tag = lambda name: f'{{{ARIN_NS}}}{name}'
+
+    def tag(child):
+        return f'{{{ARIN_NS}}}{child}'
+
     name = root.findtext(tag('name'))
     if (name or '').strip().upper() != expected_name.upper():
         raise ValueError(f'ARIN returned {name!r} instead of {expected_name!r}')
@@ -269,7 +255,6 @@ def parse_as_set(xml_text, expected_name):
 
 
 def as_set_xml(name, org_handle, description, pocs, remarks, asns):
-    """Build an as-set payload; members are always plain ASNs, never other AS-SETs."""
     def lines(parent, tag_name, values):
         if values:
             block = ET.SubElement(parent, f'{{{ARIN_NS}}}{tag_name}')
@@ -284,7 +269,7 @@ def as_set_xml(name, org_handle, description, pocs, remarks, asns):
         links = ET.SubElement(root, f'{{{ARIN_NS}}}pocLinks')
         for function, handle in pocs:
             ET.SubElement(links, f'{{{ARIN_NS}}}pocLinkRef',
-                          {'description': 'Tech' if function == 'T' else 'Admin',
+                          {'description': POC_LABELS.get(function, function),
                            'function': function, 'handle': handle})
     lines(root, 'remarks', remarks)
     ET.SubElement(root, f'{{{ARIN_NS}}}source').text = 'ARIN'
@@ -292,15 +277,16 @@ def as_set_xml(name, org_handle, description, pocs, remarks, asns):
     for asn in asns:
         ET.SubElement(members, f'{{{ARIN_NS}}}member', {'name': f'AS{asn}'})
     ET.SubElement(root, f'{{{ARIN_NS}}}name').text = name
-    return ET.tostring(root, encoding='utf-8', xml_declaration=True)
+    # ARIN's XML payloads are ASCII-only; reject anything else instead of sending escapes.
+    body = ET.tostring(root, encoding='unicode').encode('ascii')
+    return b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + body
 
 
 def upload(cfg, customer_asns, own):
-    """Publish the customer ASNs to the target set; own ASNs must never appear there."""
-    # AS-CR holds only flattened customer ASNs; own ASNs stay in AS-CATHRIX.
     asns = sorted(customer_asns)
-    if not asns or any(type(n) is not int or not 0 < n < 4294967295 for n in asns):
-        raise ValueError('Refusing empty or invalid ASN set')
+    if not asns:
+        raise ValueError('Refusing empty ASN set')
+    validate_asns(asns)
     leaked = sorted(set(asns) & set(own))
     if leaked:
         raise ValueError(f'Own ASNs must not be published to {cfg["target_set"]}: '
@@ -309,9 +295,9 @@ def upload(cfg, customer_asns, own):
     if not key:
         raise ValueError('ARIN_API_KEY is required')
     name = cfg['target_set']
-    current = arin_request('GET', 'as-set/' + urllib.parse.quote(name, safe=''), key)
+    path = 'as-set/' + urllib.parse.quote(name, safe='')
+    current = arin_request('GET', path, key)
     if current is not None:
-        # Preserve existing contacts, description and remarks; membership is replaced.
         meta = parse_as_set(current, name)
         org_handle = meta['org_handle'] or cfg['arin']['org_handle']
         description, pocs, remarks = meta['description'], meta['pocs'], meta['remarks']
@@ -322,7 +308,6 @@ def upload(cfg, customer_asns, own):
         pocs = [('T', arin['tech_c']), ('AD', arin['admin_c'])]
         remarks = []
     payload = as_set_xml(name, org_handle, description, pocs, remarks, asns)
-    path = 'as-set/' + urllib.parse.quote(name, safe='')
     if current is None:
         path = 'as-set?' + urllib.parse.urlencode({'orgHandle': org_handle})
     arin_request('PUT' if current is not None else 'POST', path, key, payload)
@@ -330,7 +315,6 @@ def upload(cfg, customer_asns, own):
 
 
 def sync(cfg, output, publish):
-    """One IRR pass: write irr.conf/result.txt, then publish the same ASNs to ARIN."""
     state = generate(cfg, output)
     if publish:
         upload(cfg, state['customers'], state['own'])

@@ -1,11 +1,11 @@
 import importlib.util
 import io
-import urllib.error
 import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch, MagicMock
+import urllib.error
+from unittest.mock import MagicMock, patch
 
 spec = importlib.util.spec_from_file_location('irr', Path(__file__).resolve().parents[1] / 'scripts/irr.py')
 irr = importlib.util.module_from_spec(spec)
@@ -13,7 +13,6 @@ spec.loader.exec_module(irr)
 
 
 def members_by_set(mapping):
-    """Stub for direct_members(cfg, set_name)."""
     def stub(cfg, set_name):
         return mapping[set_name]
     return stub
@@ -127,7 +126,6 @@ class GenerationTests(unittest.TestCase):
         self.assertIn(b'CNOC24-ARIN', payload)
         self.assertIn(b'<member name="AS112"', payload)
         self.assertNotIn(b'AS62748', payload)
-        # Members must be plain ASNs, never an AS-SET reference.
         self.assertNotIn(b'name="AS-CATHRIX"', payload)
 
     def test_default_max_asns_is_configurable(self):
@@ -155,7 +153,6 @@ class GenerationTests(unittest.TestCase):
                     irr.load_config(path)
 
     def test_default_max_asns_bounds_every_set(self):
-        # default 5 without exceptions: 5 passes, 6 is excluded.
         cfg = dict(self.cfg, default_max_asns=5, exceptions={})
         data = {'AS-FIVE': [1, 2, 3, 4, 5], 'AS-SIX': [1, 2, 3, 4, 5, 6]}
         asns, excluded, counts = irr.select_asns(cfg, list(data), data.__getitem__)
@@ -171,44 +168,34 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(excluded, ['AS-MID (6 ASNs, maximum 5)'])
         self.assertEqual(irr.asn_limit(cfg, 'AS-BIG'), 10)
 
+    def _run_sync(self, publish):
+        def bgpq(cfg, flags, objects):
+            if '-t' in flags:
+                return []
+            return [{'prefix': '192.0.2.0/24', 'exact': True}] if '-4' in flags else []
+
+        stub = members_by_set({
+            self.cfg['customer_set']: ['AS112'],
+            self.cfg['full_set']: ['AS62748', self.cfg['target_set']],
+        })
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(irr, 'direct_members', side_effect=stub), \
+                patch.object(irr, 'bgpq', side_effect=bgpq), \
+                patch.object(irr, 'upload') as up:
+            irr.sync(self.cfg, Path(directory), publish=publish)
+        return up
+
     def test_sync_publishes_same_asns_it_generated(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory)
-            stub = members_by_set({
-                self.cfg['customer_set']: ['AS112'],
-                self.cfg['full_set']: ['AS62748', self.cfg['target_set']],
-            })
-            def bgpq(cfg, flags, objects):
-                if '-t' in flags:
-                    return []
-                return [{'prefix': '192.0.2.0/24', 'exact': True}] if '-4' in flags else []
-            with patch.object(irr, 'direct_members', side_effect=stub), \
-                    patch.object(irr, 'bgpq', side_effect=bgpq), \
-                    patch.object(irr, 'upload') as up:
-                irr.sync(self.cfg, output, publish=True)
-            up.assert_called_once()
-            cfg_arg, customers, own = up.call_args.args
-            self.assertEqual(customers, {112})
-            self.assertEqual(own, {62748})
+        up = self._run_sync(publish=True)
+        up.assert_called_once()
+        _, customers, own = up.call_args.args
+        self.assertEqual(customers, {112})
+        self.assertEqual(own, {62748})
 
     def test_sync_without_publish_skips_arin(self):
-        with tempfile.TemporaryDirectory() as directory:
-            stub = members_by_set({
-                self.cfg['customer_set']: ['AS112'],
-                self.cfg['full_set']: ['AS62748', self.cfg['target_set']],
-            })
-            def bgpq(cfg, flags, objects):
-                if '-t' in flags:
-                    return []
-                return [{'prefix': '192.0.2.0/24', 'exact': True}] if '-4' in flags else []
-            with patch.object(irr, 'direct_members', side_effect=stub), \
-                    patch.object(irr, 'bgpq', side_effect=bgpq), \
-                    patch.object(irr, 'upload') as up:
-                irr.sync(self.cfg, Path(directory), publish=False)
-            up.assert_not_called()
+        self._run_sync(publish=False).assert_not_called()
 
     def test_get_omits_content_type_and_parses_errors(self):
-        import io, urllib.error
         seen = {}
 
         def fake_urlopen(request, timeout=None):
@@ -220,7 +207,6 @@ class GenerationTests(unittest.TestCase):
         with patch.object(irr.urllib.request, 'urlopen', side_effect=fake_urlopen):
             with self.assertRaises(RuntimeError) as caught:
                 irr.arin_request('GET', 'as-set/AS-CR', 'secret-key')
-        # GET must not send Content-Type, which makes ARIN answer 406.
         self.assertNotIn('content-type', seen['headers'])
         self.assertEqual(seen['headers']['authorization'], 'ApiKey secret-key')
         text = str(caught.exception)
@@ -255,6 +241,20 @@ class GenerationTests(unittest.TestCase):
                 irr.arin_request('GET', 'as-set/AS-CR', 'k')
         self.assertEqual(seen['headers']['accept'], 'application/xml')
         self.assertNotIn('content-type', seen['headers'])
+
+    def test_poc_functions_map_to_correct_labels(self):
+        payload = irr.as_set_xml('AS-CR', 'CN-578', ['x'],
+                                 [('T', 'A-ARIN'), ('R', 'B-ARIN'), ('AD', 'C-ARIN')], [], [112])
+        for expected in (b'description="Tech" function="T"',
+                         b'description="Routing" function="R"',
+                         b'description="Admin" function="AD"'):
+            self.assertIn(expected, payload)
+
+    def test_payload_is_ascii_only(self):
+        self.assertIn(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+                      irr.as_set_xml('AS-CR', 'CN-578', ['x'], [], [], [112]))
+        with self.assertRaises(UnicodeEncodeError):
+            irr.as_set_xml('AS-CR', 'CN-578', ['\u6d4b\u8bd5'], [], [], [112])
 
     def test_parse_as_set_rejects_wrong_object(self):
         xml = ('<asSet xmlns="http://www.arin.net/regrws/core/v1"><name>AS-OTHER</name></asSet>')

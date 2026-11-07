@@ -53,32 +53,28 @@ jobs:
         run: |
           set -euo pipefail
           api="repos/${GITHUB_REPOSITORY}"
-          remote_sha=$(gh api "${api}/contents/irr.conf?ref=prod" --jq .sha 2>/dev/null || true)
-          python3 - "$remote_sha" <<'PY' | gh api --method PUT "${api}/contents/irr.conf" --input -
+          if ! gh api "${api}/git/ref/heads/prod" >/dev/null 2>&1; then
+            gh api --method POST "${api}/git/refs" \
+              -f ref="refs/heads/prod" -f sha="${GITHUB_SHA}" >/dev/null
+            echo "Created branch prod from ${GITHUB_SHA}"
+          fi
+          # Body goes through stdin: -f content=... exceeds the per-argument limit.
+          for file in irr.conf result.txt; do
+            sha=$(gh api "${api}/contents/${file}?ref=prod" --jq .sha 2>/dev/null || true)
+            python3 - "$file" "$sha" <<'PY' | gh api --method PUT "${api}/contents/${file}" --input -
           import base64, json, pathlib, sys
+          name, sha = sys.argv[1], sys.argv[2]
           body = {
-              'message': 'chore: update irr.conf [skip ci]',
-              'content': base64.b64encode(pathlib.Path('generated/irr.conf').read_bytes()).decode(),
+              'message': f'chore: update {name} [skip ci]',
+              'content': base64.b64encode(pathlib.Path('generated', name).read_bytes()).decode(),
               'branch': 'prod',
           }
-          if sys.argv[1]:
-              body['sha'] = sys.argv[1]
+          if sha:
+              body['sha'] = sha
           json.dump(body, sys.stdout)
           PY
-          echo "Published irr.conf to prod"
-          result_sha=$(gh api "${api}/contents/result.txt?ref=prod" --jq .sha 2>/dev/null || true)
-          python3 - "$result_sha" <<'PY' | gh api --method PUT "${api}/contents/result.txt" --input -
-          import base64, json, pathlib, sys
-          body = {
-              'message': 'chore: update result.txt [skip ci]',
-              'content': base64.b64encode(pathlib.Path('generated/result.txt').read_bytes()).decode(),
-              'branch': 'prod',
-          }
-          if sys.argv[1]:
-              body['sha'] = sys.argv[1]
-          json.dump(body, sys.stdout)
-          PY
-          echo "Published result.txt to prod"
+            echo "Published ${file} to prod"
+          done
       - name: Show generation report
         if: always()
         run: |

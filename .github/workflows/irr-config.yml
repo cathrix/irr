@@ -30,7 +30,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # The runner is fresh every time, so fetch the last result.txt to compute deltas.
           mkdir -p generated
           gh api "repos/${GITHUB_REPOSITORY}/contents/result.txt?ref=prod" \
             -H "Accept: application/vnd.github.raw" > generated/result.txt 2>/dev/null \
@@ -54,23 +53,31 @@ jobs:
         run: |
           set -euo pipefail
           api="repos/${GITHUB_REPOSITORY}"
-          # Use the API so the prod branch never needs to be pushed to directly.
-          # Always commit: the header timestamp must advance on every run, even when
-          # the prefix list is unchanged.
           remote_sha=$(gh api "${api}/contents/irr.conf?ref=prod" --jq .sha 2>/dev/null || true)
-          args=(-f message="chore: update irr.conf [skip ci]" -f content="$(base64 -w0 generated/irr.conf)" -f branch=prod)
-          if [ -n "$remote_sha" ]; then
-            args+=(-f sha="$remote_sha")
-          fi
-          gh api --method PUT "${api}/contents/irr.conf" "${args[@]}"
+          python3 - "$remote_sha" <<'PY' | gh api --method PUT "${api}/contents/irr.conf" --input -
+          import base64, json, pathlib, sys
+          body = {
+              'message': 'chore: update irr.conf [skip ci]',
+              'content': base64.b64encode(pathlib.Path('generated/irr.conf').read_bytes()).decode(),
+              'branch': 'prod',
+          }
+          if sys.argv[1]:
+              body['sha'] = sys.argv[1]
+          json.dump(body, sys.stdout)
+          PY
           echo "Published irr.conf to prod"
-          # result.txt is the baseline for the next run's deltas.
           result_sha=$(gh api "${api}/contents/result.txt?ref=prod" --jq .sha 2>/dev/null || true)
-          result_args=(-f message="chore: update result.txt [skip ci]" -f content="$(base64 -w0 generated/result.txt)" -f branch=prod)
-          if [ -n "$result_sha" ]; then
-            result_args+=(-f sha="$result_sha")
-          fi
-          gh api --method PUT "${api}/contents/result.txt" "${result_args[@]}"
+          python3 - "$result_sha" <<'PY' | gh api --method PUT "${api}/contents/result.txt" --input -
+          import base64, json, pathlib, sys
+          body = {
+              'message': 'chore: update result.txt [skip ci]',
+              'content': base64.b64encode(pathlib.Path('generated/result.txt').read_bytes()).decode(),
+              'branch': 'prod',
+          }
+          if sys.argv[1]:
+              body['sha'] = sys.argv[1]
+          json.dump(body, sys.stdout)
+          PY
           echo "Published result.txt to prod"
       - name: Show generation report
         if: always()

@@ -10,8 +10,8 @@
 - `customer_set`：客户 AS-SET，默认 `AS-CATHRIX-CUST`，包含客户 ASN 和客户的 AS-SET。
 - `target_set`：展平后的客户 AS-SET，默认 `AS-CR`。
 - `irr_host` / `irr_port`：IRRd 查询服务器，默认 `rr.ntt.net:43`。
-- `default_max_asns`：固定为 100。
-- `exceptions`：SET 名称映射到允许的 ASN 数量上限。已配置 `AS-MOEDOVE: 500`；超过 500 仍会被整个排除。删除这项即可恢复默认 100。
+- `default_max_asns`：所有子 SET 的默认上限，默认 100。必须是正整数（`true`/`false`、字符串、小数都会被拒绝）。可以调大，但每个 exception 的上限必须大于它。
+- `exceptions`：SET 名称映射到允许的 ASN 数量上限，覆盖 `default_max_asns`。已配置 `AS-MOEDOVE: 500`；超过 500 仍会被整个排除。
 - `arin`：创建目标对象时使用的 Org Handle、联系人和描述。默认 Org 为 `CN-578`，admin/tech POC 为 `CNOC24-ARIN`。
 
 配置使用 JSON，Python 标准库即可读取，无需安装 Python 依赖。
@@ -25,6 +25,8 @@
 | `AS-CR` | 所有客户 ASN 的展平结果 | 由 Action 维护，**不包含**自有 ASN |
 
 `AS-CATHRIX` 中的 `AS-CR` 成员会被跳过，避免把 `AS-CR` 的内容重复计入自有 ASN；自有子 SET 会完整展开，因为它们属于我们而不是客户。
+
+`AS-CR` 的成员只有客户 ASN，且每一条都是普通 ASN，不会是 AS-SET——否则通过 `AS-CATHRIX` 会把自有 ASN 间接带进来。上传前还会再次校验：如果客户 ASN 与自有 ASN 有交集，直接报错并拒绝上传。
 
 ## 两层解析规则
 
@@ -43,8 +45,8 @@
 
 - 每天 UTC 00:00 生成文件，在默认分支上同步 ARIN，并把 `irr.conf` 写入 `prod` 分支。
 - 手动执行 **IRR Config Generation**：行为与定时任务完全一致，同样同步 ARIN 并更新 `prod`；两者都仅允许在默认分支执行。
-- push / pull request 执行测试和生成，不同步 ARIN，也不写 `prod`。
-- 上传在生成 job 的最后一步，API Key 仅注入该步骤。
+- push 到任意分支执行测试和生成，不同步 ARIN，也不写 `prod`。
+- 生成和上传是同一步（`sync`），只查询一次 IRR；API Key 仅注入该步骤，非发布场景不会读取。
 - 不生成 artifact；生成结果只写入 `prod` 分支。被拒 SET 和每个 SET 的计数显示在 workflow run 的 Summary 页面。
 
 ### prod 分支
@@ -79,14 +81,17 @@ sudo apt-get install bgpq4
 brew install bgpq4
 
 python3 -m unittest discover -s tests -v
-python3 scripts/irr.py generate
+# 只生成，不碰 ARIN
+python3 scripts/irr.py sync
 ```
 
-生成成功后，可用环境变量 `ARIN_API_KEY` 提供密钥并执行：
+生成并同步 ARIN 时加上 `--publish`，密钥通过环境变量提供：
 
 ```sh
-python3 scripts/irr.py upload
+ARIN_API_KEY=... python3 scripts/irr.py sync --publish
 ```
+
+`sync` 只查询一次 IRR，生成和上传使用同一份数据，不会出现两边不一致。
 
 不要将密钥放进配置或提交到 Git。生成阶段无需 ARIN Key，只需能访问 IRRd TCP 43。
 

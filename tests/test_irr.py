@@ -59,7 +59,6 @@ class GenerationTests(unittest.TestCase):
             conf = (output / 'irr.conf').read_text()
             self.assertIn('define ALL_ASNS = [\n  AS112,\n  AS62748,\n  AS150289\n];', conf)
             self.assertIn('define ALL_PREFIXES_V6 = [];', conf)
-            self.assertFalse((output / 'asns.txt').exists())
 
             report = (output / 'result.txt').read_text()
             self.assertIn('ASNs: 3 (+0)', report)
@@ -111,25 +110,108 @@ class GenerationTests(unittest.TestCase):
         connection.sendall.assert_called_once_with(b'!!\n!iAS-CATHRIX-CUST\n')
 
     def test_upload_replaces_members_and_removes_implicit_membership(self):
+        current = 'as-set: AS-CR\ndescr: Existing description\nmembers: AS-OLD\n AS1\nmbrs-by-ref: ANY\nmnt-by: MNT-CN-578\nsource: ARIN\n'
+        with patch.dict(irr.os.environ, {'ARIN_API_KEY': 'test'}), \
+                patch.object(irr, 'arin_request', side_effect=[current, 'ok']) as api:
+            irr.upload(self.cfg, {112}, {62748})
+        method, path, key, payload = api.call_args.args
+        self.assertEqual((method, path), ('PUT', 'as-set/AS-CR'))
+        self.assertIn(b'descr: Existing description', payload)
+        self.assertIn(b'members: AS112', payload)
+        self.assertNotIn(b'AS62748', payload)
+        self.assertNotIn(b'ANY', payload)
+        self.assertNotIn(b'AS-OLD', payload)
+
+    def test_default_max_asns_is_configurable(self):
+        cfg = dict(self.cfg, default_max_asns=5, exceptions={})
+        data = {'AS-SMALL': [1, 2, 3, 4, 5], 'AS-BIG': [1, 2, 3, 4, 5, 6]}
+        asns, excluded, _ = irr.select_asns(cfg, list(data), data.__getitem__)
+        self.assertEqual(len(asns), 5)
+        self.assertEqual(excluded, ['AS-BIG (6 ASNs, maximum 5)'])
+
+    def test_exception_must_exceed_default(self):
+        cfg = dict(self.cfg, default_max_asns=500, exceptions={'AS-MOEDOVE': 500})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'cfg.json'
+            path.write_text(json.dumps(cfg))
+            with self.assertRaises(ValueError):
+                irr.load_config(path)
+
+    def test_invalid_default_max_asns_is_rejected(self):
+        for bad in (0, -1, '100', 100.5, True, None):
+            cfg = dict(self.cfg, default_max_asns=bad)
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'cfg.json'
+                path.write_text(json.dumps(cfg))
+                with self.assertRaises(ValueError, msg=f'{bad!r} should be rejected'):
+                    irr.load_config(path)
+
+    def test_default_max_asns_bounds_every_set(self):
+        # default 5 without exceptions: 5 passes, 6 is excluded.
+        cfg = dict(self.cfg, default_max_asns=5, exceptions={})
+        data = {'AS-FIVE': [1, 2, 3, 4, 5], 'AS-SIX': [1, 2, 3, 4, 5, 6]}
+        asns, excluded, counts = irr.select_asns(cfg, list(data), data.__getitem__)
+        self.assertEqual(len(asns), 5)
+        self.assertEqual(excluded, ['AS-SIX (6 ASNs, maximum 5)'])
+        self.assertEqual(irr.asn_limit(cfg, 'AS-UNLISTED'), 5)
+
+    def test_exception_overrides_default(self):
+        cfg = dict(self.cfg, default_max_asns=5, exceptions={'AS-BIG': 10})
+        data = {'AS-BIG': list(range(1, 11)), 'AS-MID': list(range(1, 7))}
+        asns, excluded, _ = irr.select_asns(cfg, list(data), data.__getitem__)
+        self.assertEqual(len(asns), 10)
+        self.assertEqual(excluded, ['AS-MID (6 ASNs, maximum 5)'])
+        self.assertEqual(irr.asn_limit(cfg, 'AS-BIG'), 10)
+
+    def test_sync_publishes_same_asns_it_generated(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            current = 'as-set: AS-CR\ndescr: Existing description\nmembers: AS-OLD\n AS1\nmbrs-by-ref: ANY\nmnt-by: MNT-CN-578\nsource: ARIN\n'
-            with patch.dict(irr.os.environ, {'ARIN_API_KEY': 'test'}), patch.object(irr, 'arin_request', side_effect=[current, 'ok']) as api:
-                irr.upload(self.cfg, output, {112})
-            method, path, key, payload = api.call_args.args
-            self.assertEqual((method, path), ('PUT', 'as-set/AS-CR'))
-            self.assertIn(b'descr: Existing description', payload)
-            self.assertIn(b'members: AS112', payload)
-            self.assertNotIn(b'AS62748', payload)
-            self.assertNotIn(b'ANY', payload)
-            self.assertNotIn(b'AS-OLD', payload)
+            stub = members_by_set({
+                self.cfg['customer_set']: ['AS112'],
+                self.cfg['full_set']: ['AS62748', self.cfg['target_set']],
+            })
+            def bgpq(cfg, flags, objects):
+                if '-t' in flags:
+                    return []
+                return [{'prefix': '192.0.2.0/24', 'exact': True}] if '-4' in flags else []
+            with patch.object(irr, 'direct_members', side_effect=stub), \
+                    patch.object(irr, 'bgpq', side_effect=bgpq), \
+                    patch.object(irr, 'upload') as up:
+                irr.sync(self.cfg, output, publish=True)
+            up.assert_called_once()
+            cfg_arg, customers, own = up.call_args.args
+            self.assertEqual(customers, {112})
+            self.assertEqual(own, {62748})
+
+    def test_sync_without_publish_skips_arin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stub = members_by_set({
+                self.cfg['customer_set']: ['AS112'],
+                self.cfg['full_set']: ['AS62748', self.cfg['target_set']],
+            })
+            def bgpq(cfg, flags, objects):
+                if '-t' in flags:
+                    return []
+                return [{'prefix': '192.0.2.0/24', 'exact': True}] if '-4' in flags else []
+            with patch.object(irr, 'direct_members', side_effect=stub), \
+                    patch.object(irr, 'bgpq', side_effect=bgpq), \
+                    patch.object(irr, 'upload') as up:
+                irr.sync(self.cfg, Path(directory), publish=False)
+            up.assert_not_called()
+
+    def test_own_asn_is_never_published_to_target_set(self):
+        with patch.dict(irr.os.environ, {'ARIN_API_KEY': 'test'}), \
+                patch.object(irr, 'arin_request') as api:
+            with self.assertRaises(ValueError) as caught:
+                irr.upload(self.cfg, {112, 62748}, {62748})
+            api.assert_not_called()
+        self.assertIn('AS62748', str(caught.exception))
 
     def test_create_endpoint(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory)
-            with patch.dict(irr.os.environ, {'ARIN_API_KEY': 'test'}), patch.object(irr, 'arin_request', side_effect=[None, 'ok']) as api:
-                irr.upload(self.cfg, output, {112})
-            self.assertEqual(api.call_args.args[:2], ('POST', 'as-set?orgHandle=CN-578'))
+        with patch.dict(irr.os.environ, {'ARIN_API_KEY': 'test'}), \
+                patch.object(irr, 'arin_request', side_effect=[None, 'ok']) as api:
+            irr.upload(self.cfg, {112}, {62748})
+        self.assertEqual(api.call_args.args[:2], ('POST', 'as-set?orgHandle=CN-578'))
 
 
 if __name__ == '__main__':

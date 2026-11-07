@@ -24,18 +24,31 @@ def validate_set(value):
     return value
 
 
+DEFAULT_MAX_ASNS = 100
+
+
 def load_config(path):
     cfg = json.loads(Path(path).read_text())
     validate_set(cfg['full_set'])
     validate_set(cfg['customer_set'])
     validate_set(cfg['target_set'])
-    for name, limit in cfg.get('exceptions', {}).items():
+    default = cfg.get('default_max_asns', DEFAULT_MAX_ASNS)
+    # bool is an int subclass, so reject it explicitly before the range check.
+    if isinstance(default, bool) or not isinstance(default, int) or default <= 0:
+        raise ValueError('default_max_asns must be a positive integer')
+    exceptions = cfg.get('exceptions', {})
+    if not isinstance(exceptions, dict):
+        raise ValueError('exceptions must map AS-SET names to limits')
+    for name, limit in exceptions.items():
         validate_set(name)
-        if type(limit) is not int or limit <= 100:
-            raise ValueError('Each exception must specify an integer maximum above 100')
-    if cfg.get('default_max_asns', 100) != 100:
-        raise ValueError('Default maximum must be 100; use explicit exceptions')
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= default:
+            raise ValueError(f'Exception for {name} must exceed default_max_asns ({default})')
     return cfg
+
+
+def asn_limit(cfg, set_name):
+    """Per-set cap: an explicit exception wins, otherwise the configured default."""
+    return cfg.get('exceptions', {}).get(set_name, cfg.get('default_max_asns', DEFAULT_MAX_ASNS))
 
 
 def direct_members(cfg, set_name):
@@ -90,7 +103,7 @@ def select_asns(cfg, members, expand):
         if any(type(n) is not int or not 0 < n < 4294967295 for n in values):
             raise ValueError('Invalid ASN response')
         values = set(values)
-        limit = cfg.get('exceptions', {}).get(member, 100)
+        limit = asn_limit(cfg, member)
         counts.append((member, len(values), limit))
         if len(values) <= limit:
             accepted.update(values)
@@ -196,6 +209,7 @@ def generate(cfg, output):
         result_report(generated_at, all_asns, v4, v6, excluded, previous))
     print(f'Generated {len(all_asns)} ASNs, {len(v4)} IPv4 and {len(v6)} IPv6 prefixes; '
           f'excluded {len(excluded)} AS-SETs')
+    return {'customers': customers, 'own': own, 'all': all_asns}
 
 
 def arin_request(method, path, key, body=None):
@@ -213,11 +227,16 @@ def arin_request(method, path, key, body=None):
         raise RuntimeError(f'ARIN {method} failed: HTTP {exc.code}') from None
 
 
-def upload(cfg, output, customer_asns):
+def upload(cfg, customer_asns, own):
+    """Publish the customer ASNs to the target set; own ASNs must never appear there."""
     # AS-CR holds only flattened customer ASNs; own ASNs stay in AS-CATHRIX.
     asns = sorted(customer_asns)
     if not asns or any(type(n) is not int or not 0 < n < 4294967295 for n in asns):
         raise ValueError('Refusing empty or invalid ASN set')
+    leaked = sorted(set(asns) & set(own))
+    if leaked:
+        raise ValueError(f'Own ASNs must not be published to {cfg["target_set"]}: '
+                         + ', '.join(f'AS{n}' for n in leaked))
     key = os.environ.get('ARIN_API_KEY')
     if not key:
         raise ValueError('ARIN_API_KEY is required')
@@ -247,6 +266,8 @@ def upload(cfg, output, customer_asns):
         if any('\n' in v or '\r' in v for v in fields.values()):
             raise ValueError('Invalid RPSL configuration')
         lines = [f'{k}: {v}' for k, v in fields.items()]
+    # Members of the target set must be plain ASNs: never another AS-SET, which could
+    # pull our own ASNs back in through AS-CATHRIX.
     lines += [f'members: AS{n}' for n in asns]
     payload = ('\n'.join(lines) + '\n').encode()
     path = 'as-set/' + name if current is not None else 'as-set?' + urllib.parse.urlencode(
@@ -255,20 +276,28 @@ def upload(cfg, output, customer_asns):
     print(f"Synchronized {cfg['target_set']} with {len(asns)} ASNs")
 
 
+def sync(cfg, output, publish):
+    """One IRR pass: write irr.conf/result.txt, then publish the same ASNs to ARIN."""
+    state = generate(cfg, output)
+    if publish:
+        upload(cfg, state['customers'], state['own'])
+    else:
+        print('Skipping ARIN upload (not enabled for this run)')
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['generate', 'upload'])
+    parser.add_argument('command', choices=['sync', 'generate'])
     parser.add_argument('--config', default='config/irr.json')
     parser.add_argument('--output', type=Path, default=Path('generated'))
+    parser.add_argument('--publish', action='store_true',
+                        help='also synchronize the target AS-SET with ARIN')
     args = parser.parse_args()
     cfg = load_config(args.config)
     if args.command == 'generate':
         generate(cfg, args.output)
     else:
-        # Resolve the customer ASNs again so the upload never depends on a file on disk.
-        customers, _, _ = select_asns(cfg, direct_members(cfg, cfg['customer_set']),
-                                      lambda member: bgpq(cfg, ['-t', '-L', '1'], [member]))
-        upload(cfg, args.output, customers)
+        sync(cfg, args.output, args.publish)
 
 
 if __name__ == '__main__':

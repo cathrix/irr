@@ -26,7 +26,8 @@ def validate_set(value):
 
 def load_config(path):
     cfg = json.loads(Path(path).read_text())
-    validate_set(cfg['source_set'])
+    validate_set(cfg['full_set'])
+    validate_set(cfg['customer_set'])
     validate_set(cfg['target_set'])
     for name, limit in cfg.get('exceptions', {}).items():
         validate_set(name)
@@ -37,15 +38,15 @@ def load_config(path):
     return cfg
 
 
-def direct_members(cfg):
+def direct_members(cfg, set_name):
     # IRRd A<n> counts BYTES, not lines. !! enables multiple commands and has no reply.
     with socket.create_connection((cfg['irr_host'], cfg.get('irr_port', 43)), timeout=30) as sock:
         sock.settimeout(30)
-        sock.sendall(('!!\n!i' + cfg['source_set'] + '\n').encode('ascii'))
+        sock.sendall(('!!\n!i' + set_name + '\n').encode('ascii'))
         with sock.makefile('rb') as stream:
             status = stream.readline().strip()
             if status == b'D':
-                raise RuntimeError('Source AS-SET missing from IRR')
+                raise RuntimeError(f'AS-SET {set_name} missing from IRR')
             if status == b'C':
                 return []
             if not status.startswith(b'A') or not status[1:].isdigit():
@@ -73,7 +74,8 @@ def bgpq(cfg, flags, objects):
 
 
 def select_asns(cfg, members, expand):
-    accepted, rejected, report = set(), [], []
+    """Return accepted ASNs plus the excluded AS-SETs and the count of every child set."""
+    accepted, excluded, counts = set(), [], []
     for member in sorted(set(members)):
         match = ASN.fullmatch(member)
         if match:
@@ -89,19 +91,39 @@ def select_asns(cfg, members, expand):
             raise ValueError('Invalid ASN response')
         values = set(values)
         limit = cfg.get('exceptions', {}).get(member, 100)
-        entry = {'set': member, 'asn_count': len(values), 'maximum': limit,
-                 'accepted': len(values) <= limit}
-        report.append(entry)
-        if entry['accepted']:
+        counts.append((member, len(values), limit))
+        if len(values) <= limit:
             accepted.update(values)
         else:
-            rejected.append(f"{member}: {len(values)} ASNs exceeds maximum {limit}")
-    return sorted(accepted), rejected, report
+            excluded.append(f'{member} ({len(values)} ASNs, maximum {limit})')
+    return accepted, excluded, counts
+
+
+def own_asns(cfg):
+    """ASNs of AS-CATHRIX excluding the target set, which only holds flattened customers."""
+    asns = set()
+    for member in direct_members(cfg, cfg['full_set']):
+        match = ASN.fullmatch(member)
+        if match:
+            number = int(match[1])
+            if not 0 < number < 4294967295:
+                raise ValueError('Invalid ASN')
+            asns.add(number)
+        elif member == cfg['target_set']:
+            continue
+        else:
+            # Own sets are expanded fully: their nested sets are ours, not customers.
+            values = bgpq(cfg, ['-t'], [member])
+            if any(type(n) is not int or not 0 < n < 4294967295 for n in values):
+                raise ValueError('Invalid ASN response')
+            asns.update(values)
+    return asns
 
 
 def prefixes(cfg, asns, family):
     networks = set()
     # Exact prefixes: deliberately omit -A, which can generate prefix-length ranges.
+    asns = sorted(asns)
     for start in range(0, len(asns), 200):
         for entry in bgpq(cfg, [f'-{family}'], ['AS' + str(n) for n in asns[start:start + 200]]):
             net = ipaddress.ip_network(entry['prefix'], strict=True)
@@ -111,31 +133,69 @@ def prefixes(cfg, asns, family):
     return sorted(networks, key=lambda n: (int(n.network_address), n.prefixlen))
 
 
-def bird_define(name, networks):
-    if not networks:
+def bird_define(name, values):
+    if not values:
         return f'define {name} = [];\n'
-    return f'define {name} = [\n  ' + ',\n  '.join(map(str, networks)) + '\n];\n'
+    return f'define {name} = [\n  ' + ',\n  '.join(map(str, values)) + '\n];\n'
 
 
-def irr_conf(v4, v6, generated_at):
-    header = f'# Generated at {generated_at}\n'
-    return header + bird_define('ALL_PREFIXES_V4', v4) + '\n' + bird_define('ALL_PREFIXES_V6', v6)
+def irr_conf(all_asns, v4, v6, generated_at):
+    return (f'# Generated at {generated_at}\n\n'
+            + bird_define('ALL_ASNS', [f'AS{n}' for n in all_asns]) + '\n'
+            + bird_define('ALL_PREFIXES_V4', v4) + '\n'
+            + bird_define('ALL_PREFIXES_V6', v6))
+
+
+def delta(current, previous):
+    if previous is None:
+        return '+0'
+    change = current - previous
+    return f'+{change}' if change >= 0 else str(change)
+
+
+def result_report(generated_at, all_asns, v4, v6, excluded, previous=None):
+    """previous holds the last run's counts, or None when there is nothing to compare."""
+    previous = previous or {}
+    lines = [f'Generated at {generated_at}', '',
+             f'ASNs: {len(all_asns)} ({delta(len(all_asns), previous.get("asns"))})',
+             f'IPv4 Prefixes: {len(v4)} ({delta(len(v4), previous.get("v4"))})',
+             f'IPv6 Prefixes: {len(v6)} ({delta(len(v6), previous.get("v6"))})', '',
+             'Excluded AS-SET:']
+    lines += [f'  {item}' for item in excluded] if excluded else ['  none']
+    return '\n'.join(lines) + '\n'
+
+
+def previous_counts(path):
+    """Read the counts of the last run from an existing result.txt, if any."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return None
+    found = {}
+    for key, label in (('asns', 'ASNs'), ('v4', 'IPv4 Prefixes'), ('v6', 'IPv6 Prefixes')):
+        match = re.search(rf'^{label}: (\d+)', text, re.MULTILINE)
+        if not match:
+            return None
+        found[key] = int(match.group(1))
+    return found
 
 
 def generate(cfg, output):
     output.mkdir(parents=True, exist_ok=True)
-    asns, rejected, report = select_asns(cfg, direct_members(cfg),
-                                         lambda member: bgpq(cfg, ['-t', '-L', '1'], [member]))
-    (output / 'rejected_sets.txt').write_text('\n'.join(rejected) + ('\n' if rejected else ''))
-    (output / 'sets.json').write_text(json.dumps(report, indent=2) + '\n')
-    if not asns:
-        raise RuntimeError('No qualified ASNs; refusing to generate or publish an empty set')
-    v4, v6 = prefixes(cfg, asns, 4), prefixes(cfg, asns, 6)
-    (output / 'asns.txt').write_text(''.join(f'AS{n}\n' for n in asns))
+    previous = previous_counts(output / 'result.txt')
+    customers, excluded, counts = select_asns(cfg, direct_members(cfg, cfg['customer_set']),
+                                              lambda member: bgpq(cfg, ['-t', '-L', '1'], [member]))
+    if not customers:
+        raise RuntimeError('No qualified customer ASNs; refusing to generate or publish an empty set')
+    own = own_asns(cfg)
+    all_asns = sorted(customers | own)
+    v4, v6 = prefixes(cfg, all_asns, 4), prefixes(cfg, all_asns, 6)
     generated_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    (output / 'irr.conf').write_text(irr_conf(v4, v6, generated_at))
-    (output / 'manifest.json').write_text(json.dumps({'config': cfg, 'asns': asns}, indent=2) + '\n')
-    print(f'Generated {len(asns)} ASNs, {len(v4)} IPv4 and {len(v6)} IPv6 prefixes; rejected {len(rejected)} SETs')
+    (output / 'irr.conf').write_text(irr_conf(all_asns, v4, v6, generated_at))
+    (output / 'result.txt').write_text(
+        result_report(generated_at, all_asns, v4, v6, excluded, previous))
+    print(f'Generated {len(all_asns)} ASNs, {len(v4)} IPv4 and {len(v6)} IPv6 prefixes; '
+          f'excluded {len(excluded)} AS-SETs')
 
 
 def arin_request(method, path, key, body=None):
@@ -153,11 +213,9 @@ def arin_request(method, path, key, body=None):
         raise RuntimeError(f'ARIN {method} failed: HTTP {exc.code}') from None
 
 
-def upload(cfg, output):
-    manifest = json.loads((output / 'manifest.json').read_text())
-    if manifest['config'] != cfg:
-        raise ValueError('Configuration changed since generation')
-    asns = manifest['asns']
+def upload(cfg, output, customer_asns):
+    # AS-CR holds only flattened customer ASNs; own ASNs stay in AS-CATHRIX.
+    asns = sorted(customer_asns)
     if not asns or any(type(n) is not int or not 0 < n < 4294967295 for n in asns):
         raise ValueError('Refusing empty or invalid ASN set')
     key = os.environ.get('ARIN_API_KEY')
@@ -204,7 +262,13 @@ def main():
     parser.add_argument('--output', type=Path, default=Path('generated'))
     args = parser.parse_args()
     cfg = load_config(args.config)
-    (generate if args.command == 'generate' else upload)(cfg, args.output)
+    if args.command == 'generate':
+        generate(cfg, args.output)
+    else:
+        # Resolve the customer ASNs again so the upload never depends on a file on disk.
+        customers, _, _ = select_asns(cfg, direct_members(cfg, cfg['customer_set']),
+                                      lambda member: bgpq(cfg, ['-t', '-L', '1'], [member]))
+        upload(cfg, args.output, customers)
 
 
 if __name__ == '__main__':

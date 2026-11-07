@@ -31,6 +31,16 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Install bgpq4
         run: sudo apt-get update && sudo apt-get install -y bgpq4
+      - name: Restore previous result for comparison
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The runner is fresh every time, so fetch the last result.txt to compute deltas.
+          mkdir -p generated
+          gh api "repos/${GITHUB_REPOSITORY}/contents/result.txt?ref=prod" \
+            -H "Accept: application/vnd.github.raw" > generated/result.txt 2>/dev/null \
+            || echo "No previous result.txt; deltas will start at +0"
       - name: Generate qualified ASNs and BIRD configuration
         run: python scripts/irr.py generate
       - name: Publish irr.conf to prod branch
@@ -52,32 +62,24 @@ jobs:
           fi
           gh api --method PUT "${api}/contents/irr.conf" "${args[@]}"
           echo "Published irr.conf to prod"
-      - name: Save generated files and rejection report
+          # result.txt is the baseline for the next run's deltas.
+          result_sha=$(gh api "${api}/contents/result.txt?ref=prod" --jq .sha 2>/dev/null || true)
+          result_args=(-f message="chore: update result.txt [skip ci]" -f content="$(base64 -w0 generated/result.txt)" -f branch=prod)
+          if [ -n "$result_sha" ]; then
+            result_args+=(-f sha="$result_sha")
+          fi
+          gh api --method PUT "${api}/contents/result.txt" "${result_args[@]}"
+          echo "Published result.txt to prod"
+      - name: Show generation report
         if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: irr-config
-          path: generated/
-          if-no-files-found: warn
-          retention-days: 30
-
-  publish:
-    needs: generate
-    if: >-
-      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-26.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-      - uses: actions/download-artifact@v8
-        with:
-          name: irr-config
-          path: generated/
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat generated/result.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "Generation did not finish." >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
       - name: Synchronize ARIN AS-SET
+        if: >-
+          github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         env:
           ARIN_API_KEY: ${{ secrets.ARIN_API_KEY }}
         run: python scripts/irr.py upload

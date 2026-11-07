@@ -199,6 +199,26 @@ class GenerationTests(unittest.TestCase):
                 irr.sync(self.cfg, Path(directory), publish=False)
             up.assert_not_called()
 
+    def test_get_omits_content_type_and_parses_errors(self):
+        import io, urllib.error
+        seen = {}
+
+        def fake_urlopen(request, timeout=None):
+            seen['headers'] = {k.lower(): v for k, v in request.header_items()}
+            raise urllib.error.HTTPError(
+                request.full_url, 406, 'Not Acceptable', {},
+                io.BytesIO(b'code:  E_AUTHENTICATION\nmessage:  The API key was invalid.\n'))
+
+        with patch.object(irr.urllib.request, 'urlopen', side_effect=fake_urlopen):
+            with self.assertRaises(RuntimeError) as caught:
+                irr.arin_request('GET', 'as-set/AS-CR', 'secret-key')
+        # GET must not send Content-Type, which makes ARIN answer 406.
+        self.assertNotIn('content-type', seen['headers'])
+        self.assertEqual(seen['headers']['authorization'], 'ApiKey secret-key')
+        text = str(caught.exception)
+        self.assertIn('E_AUTHENTICATION', text)
+        self.assertNotIn('secret-key', text)
+
     def test_own_asn_is_never_published_to_target_set(self):
         with patch.dict(irr.os.environ, {'ARIN_API_KEY': 'test'}), \
                 patch.object(irr, 'arin_request') as api:

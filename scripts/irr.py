@@ -212,19 +212,38 @@ def generate(cfg, output):
     return {'customers': customers, 'own': own, 'all': all_asns}
 
 
+def arin_error(exc):
+    """Extract ARIN's error code/message so failures are diagnosable without leaking secrets."""
+    try:
+        body = exc.read().decode('utf-8', 'replace')
+    except Exception:
+        return f'HTTP {exc.code}'
+    # RPSL errors look like "code:   E_X\nmessage:  text"; XML errors use <code>/<message>.
+    code = re.search(r'code\s*:?\s*>?\s*([A-Z][A-Z_]+)', body)
+    message = re.search(r'message\s*:?\s*>?\s*([^<\n]+)', body)
+    parts = [f'HTTP {exc.code}']
+    if code:
+        parts.append(code.group(1).strip())
+    if message:
+        parts.append(message.group(1).strip())
+    return ' '.join(parts)
+
+
 def arin_request(method, path, key, body=None):
+    headers = {'Authorization': 'ApiKey ' + key, 'Accept': 'application/rpsl'}
+    # Content-Type is only meaningful when a payload is sent; ARIN answers 406 without it
+    # on GET, so it must not be set for requests without a body.
+    if body is not None:
+        headers['Content-Type'] = 'application/rpsl'
     request = urllib.request.Request('https://reg.arin.net/rest/irr/' + path,
-                                     data=body, method=method, headers={'Authorization': 'ApiKey ' + key,
-                                                                        'Accept': 'application/rpsl',
-                                                                        'Content-Type': 'application/rpsl'})
+                                     data=body, method=method, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             return response.read().decode()
     except urllib.error.HTTPError as exc:
         if method == 'GET' and exc.code == 404:
             return None
-        # Do not print request headers or raw API responses that may contain credentials.
-        raise RuntimeError(f'ARIN {method} failed: HTTP {exc.code}') from None
+        raise RuntimeError(f'ARIN {method} failed: {arin_error(exc)}') from None
 
 
 def upload(cfg, customer_asns, own):

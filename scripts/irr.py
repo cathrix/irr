@@ -13,6 +13,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 
 ASN = re.compile(r"AS([0-9]+)$")
 SET = re.compile(r"(?:AS[0-9]+:|AS-[A-Z0-9_-]+:)*AS-[A-Z0-9_-]+$")
@@ -229,12 +230,15 @@ def arin_error(exc):
     return ' '.join(parts)
 
 
+ARIN_NS = 'http://www.arin.net/regrws/core/v1'
+
+
 def arin_request(method, path, key, body=None):
-    headers = {'Authorization': 'ApiKey ' + key, 'Accept': 'application/rpsl'}
-    # Content-Type is only meaningful when a payload is sent; ARIN answers 406 without it
-    # on GET, so it must not be set for requests without a body.
+    # ARIN only accepts application/xml; application/rpsl is rejected with
+    # E_BAD_REQUEST "No match for accept header".
+    headers = {'Authorization': 'ApiKey ' + key, 'Accept': 'application/xml'}
     if body is not None:
-        headers['Content-Type'] = 'application/rpsl'
+        headers['Content-Type'] = 'application/xml'
     request = urllib.request.Request('https://reg.arin.net/rest/irr/' + path,
                                      data=body, method=method, headers=headers)
     try:
@@ -244,6 +248,51 @@ def arin_request(method, path, key, body=None):
         if method == 'GET' and exc.code == 404:
             return None
         raise RuntimeError(f'ARIN {method} failed: {arin_error(exc)}') from None
+
+
+def parse_as_set(xml_text, expected_name):
+    """Read the metadata we must preserve from an existing as-set XML document."""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise ValueError(f'ARIN returned unparsable XML: {exc}') from None
+    tag = lambda name: f'{{{ARIN_NS}}}{name}'
+    name = root.findtext(tag('name'))
+    if (name or '').strip().upper() != expected_name.upper():
+        raise ValueError(f'ARIN returned {name!r} instead of {expected_name!r}')
+    return {
+        'org_handle': (root.findtext(tag('orgHandle')) or '').strip(),
+        'description': [(line.text or '') for line in root.findall(f'{tag("description")}/{tag("line")}')],
+        'pocs': [(p.get('function'), p.get('handle')) for p in root.findall(f'{tag("pocLinks")}/{tag("pocLinkRef")}')],
+        'remarks': [(line.text or '') for line in root.findall(f'{tag("remarks")}/{tag("line")}')],
+    }
+
+
+def as_set_xml(name, org_handle, description, pocs, remarks, asns):
+    """Build an as-set payload; members are always plain ASNs, never other AS-SETs."""
+    def lines(parent, tag_name, values):
+        if values:
+            block = ET.SubElement(parent, f'{{{ARIN_NS}}}{tag_name}')
+            for index, value in enumerate(values):
+                ET.SubElement(block, f'{{{ARIN_NS}}}line', {'number': str(index)}).text = value
+
+    ET.register_namespace('', ARIN_NS)
+    root = ET.Element(f'{{{ARIN_NS}}}asSet')
+    ET.SubElement(root, f'{{{ARIN_NS}}}orgHandle').text = org_handle
+    lines(root, 'description', description)
+    if pocs:
+        links = ET.SubElement(root, f'{{{ARIN_NS}}}pocLinks')
+        for function, handle in pocs:
+            ET.SubElement(links, f'{{{ARIN_NS}}}pocLinkRef',
+                          {'description': 'Tech' if function == 'T' else 'Admin',
+                           'function': function, 'handle': handle})
+    lines(root, 'remarks', remarks)
+    ET.SubElement(root, f'{{{ARIN_NS}}}source').text = 'ARIN'
+    members = ET.SubElement(root, f'{{{ARIN_NS}}}members')
+    for asn in asns:
+        ET.SubElement(members, f'{{{ARIN_NS}}}member', {'name': f'AS{asn}'})
+    ET.SubElement(root, f'{{{ARIN_NS}}}name').text = name
+    return ET.tostring(root, encoding='utf-8', xml_declaration=True)
 
 
 def upload(cfg, customer_asns, own):
@@ -259,40 +308,25 @@ def upload(cfg, customer_asns, own):
     key = os.environ.get('ARIN_API_KEY')
     if not key:
         raise ValueError('ARIN_API_KEY is required')
-    name = urllib.parse.quote(cfg['target_set'], safe='')
-    current = arin_request('GET', 'as-set/' + name, key)
+    name = cfg['target_set']
+    current = arin_request('GET', 'as-set/' + urllib.parse.quote(name, safe=''), key)
     if current is not None:
-        # Preserve existing contacts, description, and other metadata; replace membership.
-        lines, drop = [], False
-        for line in current.splitlines():
-            if line[:1].isspace() or line.startswith('+'):
-                if not drop:
-                    lines.append(line)
-                continue
-            field = line.partition(':')[0].lower()
-            drop = field in {'members', 'mbrs-by-ref', 'created', 'last-modified'} or line.startswith('%')
-            if not drop and line.strip():
-                lines.append(line)
-        if not any(
-                line.lower().startswith('as-set:') and line.partition(':')[2].strip().upper() == cfg['target_set'] for
-                line in lines):
-            raise ValueError('Unexpected ARIN object')
+        # Preserve existing contacts, description and remarks; membership is replaced.
+        meta = parse_as_set(current, name)
+        org_handle = meta['org_handle'] or cfg['arin']['org_handle']
+        description, pocs, remarks = meta['description'], meta['pocs'], meta['remarks']
     else:
         arin = cfg['arin']
-        fields = {'as-set': cfg['target_set'], 'descr': arin['description'],
-                  'admin-c': arin['admin_c'], 'tech-c': arin['tech_c'],
-                  'mnt-by': 'MNT-' + arin['org_handle'], 'source': 'ARIN'}
-        if any('\n' in v or '\r' in v for v in fields.values()):
-            raise ValueError('Invalid RPSL configuration')
-        lines = [f'{k}: {v}' for k, v in fields.items()]
-    # Members of the target set must be plain ASNs: never another AS-SET, which could
-    # pull our own ASNs back in through AS-CATHRIX.
-    lines += [f'members: AS{n}' for n in asns]
-    payload = ('\n'.join(lines) + '\n').encode()
-    path = 'as-set/' + name if current is not None else 'as-set?' + urllib.parse.urlencode(
-        {'orgHandle': cfg['arin']['org_handle']})
+        org_handle = arin['org_handle']
+        description = [arin['description']]
+        pocs = [('T', arin['tech_c']), ('AD', arin['admin_c'])]
+        remarks = []
+    payload = as_set_xml(name, org_handle, description, pocs, remarks, asns)
+    path = 'as-set/' + urllib.parse.quote(name, safe='')
+    if current is None:
+        path = 'as-set?' + urllib.parse.urlencode({'orgHandle': org_handle})
     arin_request('PUT' if current is not None else 'POST', path, key, payload)
-    print(f"Synchronized {cfg['target_set']} with {len(asns)} ASNs")
+    print(f"Synchronized {name} with {len(asns)} ASNs")
 
 
 def sync(cfg, output, publish):

@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import urllib.error
 import json
 from pathlib import Path
 import tempfile
@@ -109,18 +110,25 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(irr.direct_members(self.cfg, 'AS-CATHRIX-CUST'), ['AS-CHILD', 'AS112'])
         connection.sendall.assert_called_once_with(b'!!\n!iAS-CATHRIX-CUST\n')
 
-    def test_upload_replaces_members_and_removes_implicit_membership(self):
-        current = 'as-set: AS-CR\ndescr: Existing description\nmembers: AS-OLD\n AS1\nmbrs-by-ref: ANY\nmnt-by: MNT-CN-578\nsource: ARIN\n'
+    def test_upload_replaces_members_and_preserves_metadata(self):
+        current = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<asSet xmlns="http://www.arin.net/regrws/core/v1">'
+                   '<description><line number="0">Cathrix Network Inc.</line></description>'
+                   '<orgHandle>CN-578</orgHandle>'
+                   '<pocLinks><pocLinkRef description="Tech" function="T" handle="CNOC24-ARIN"/>'
+                   '<pocLinkRef description="Admin" function="AD" handle="CNOC24-ARIN"/></pocLinks>'
+                   '<source>ARIN</source><name>AS-CR</name></asSet>')
         with patch.dict(irr.os.environ, {'ARIN_API_KEY': 'test'}), \
                 patch.object(irr, 'arin_request', side_effect=[current, 'ok']) as api:
             irr.upload(self.cfg, {112}, {62748})
         method, path, key, payload = api.call_args.args
         self.assertEqual((method, path), ('PUT', 'as-set/AS-CR'))
-        self.assertIn(b'descr: Existing description', payload)
-        self.assertIn(b'members: AS112', payload)
+        self.assertIn(b'Cathrix Network Inc.', payload)
+        self.assertIn(b'CNOC24-ARIN', payload)
+        self.assertIn(b'<member name="AS112"', payload)
         self.assertNotIn(b'AS62748', payload)
-        self.assertNotIn(b'ANY', payload)
-        self.assertNotIn(b'AS-OLD', payload)
+        # Members must be plain ASNs, never an AS-SET reference.
+        self.assertNotIn(b'name="AS-CATHRIX"', payload)
 
     def test_default_max_asns_is_configurable(self):
         cfg = dict(self.cfg, default_max_asns=5, exceptions={})
@@ -232,6 +240,26 @@ class GenerationTests(unittest.TestCase):
                 patch.object(irr, 'arin_request', side_effect=[None, 'ok']) as api:
             irr.upload(self.cfg, {112}, {62748})
         self.assertEqual(api.call_args.args[:2], ('POST', 'as-set?orgHandle=CN-578'))
+        payload = api.call_args.args[3]
+        self.assertIn(b'<member name="AS112"', payload)
+
+    def test_arin_uses_xml_media_type(self):
+        seen = {}
+
+        def fake_urlopen(request, timeout=None):
+            seen['headers'] = {k.lower(): v for k, v in request.header_items()}
+            raise urllib.error.HTTPError(request.full_url, 500, 'err', {}, io.BytesIO(b''))
+
+        with patch.object(irr.urllib.request, 'urlopen', side_effect=fake_urlopen):
+            with self.assertRaises(RuntimeError):
+                irr.arin_request('GET', 'as-set/AS-CR', 'k')
+        self.assertEqual(seen['headers']['accept'], 'application/xml')
+        self.assertNotIn('content-type', seen['headers'])
+
+    def test_parse_as_set_rejects_wrong_object(self):
+        xml = ('<asSet xmlns="http://www.arin.net/regrws/core/v1"><name>AS-OTHER</name></asSet>')
+        with self.assertRaises(ValueError):
+            irr.parse_as_set(xml, 'AS-CR')
 
 
 if __name__ == '__main__':

@@ -104,13 +104,12 @@ ARIN_API_KEY=... python3 scripts/irr.py sync --publish
 
 ## ARIN API
 
-实现依据 [ARIN IRR RESTful API User Guide](https://www.arin.net/resources/manage/irr/irr-restful/#as-set-objects)：
+实现依据 [ARIN IRR RESTful API User Guide](https://www.arin.net/resources/manage/irr/irr-restful/#as-set-objects)，使用 **XML** 而非 RPSL：ARIN 只接受 `Accept: application/xml`，`application/rpsl` 会返回 `E_BAD_REQUEST No match for accept header`。
 
 - `GET /rest/irr/as-set/AS-CR` 读取现有对象。
-- 存在时 `PUT /rest/irr/as-set/AS-CR` 更新。
-- 仅 GET 返回 404 时，通过 `POST /rest/irr/as-set?orgHandle=CN-578` 创建。
-- 使用 `Authorization: ApiKey <key>`，`Accept` 和 `Content-Type` 均为 `application/rpsl`。Key 不放在 URL。
+- 存在时 `PUT /rest/irr/as-set/AS-CR` 更新；仅 GET 返回 404 时，通过 `POST /rest/irr/as-set?orgHandle=CN-578` 创建。
+- 请求头 `Authorization: ApiKey <key>`、`Accept: application/xml`；有 payload 时才加 `Content-Type: application/xml`。Key 不放在 URL。
 
-更新时保留现有描述、联系人等元数据，替换全部 `members`，移除 `mbrs-by-ref`，使成员明确等于生成的 ASN 列表。现有对象仍须满足 ARIN 的对象权限限制；公共查询看到空结果不代表有权限管理该对象。
+更新时保留现有 `descr`、`admin-c`/`tech-c` 和 `remarks`，替换全部 `members`。成员只写 `member name="AS12345"`，不会出现 AS-SET 引用。现有对象仍须满足 ARIN 的对象权限限制。
 
 尚未使用真实 API Key 执行远程写入；离线测试覆盖创建及更新请求。首次上线前，建议先手动执行一次 workflow，在 Summary 页面确认各 SET 的计数符合预期，再检查 `prod` 分支上的 `irr.conf`。

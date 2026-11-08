@@ -143,7 +143,7 @@ def bird_define(name, values):
 
 def irr_conf(all_asns, v4, v6, generated_at):
     return (f'# Generated at {generated_at}\n\n'
-            + bird_define('ALL_ASNS', [f'AS{n}' for n in all_asns]) + '\n'
+            + bird_define('ALL_ASNS', all_asns) + '\n'
             + bird_define('ALL_PREFIXES_V4', v4) + '\n'
             + bird_define('ALL_PREFIXES_V6', v6))
 

@@ -57,7 +57,7 @@ class GenerationTests(unittest.TestCase):
                 irr.generate(self.cfg, output)
 
             conf = (output / 'irr.conf').read_text()
-            self.assertIn('define ALL_ASNS = [\n  AS112,\n  AS62748,\n  AS150289\n];', conf)
+            self.assertIn('define ALL_ASNS = [\n  112,\n  62748,\n  150289\n];', conf)
             self.assertIn('define ALL_PREFIXES_V6 = [];', conf)
 
             report = (output / 'result.txt').read_text()
@@ -89,7 +89,7 @@ class GenerationTests(unittest.TestCase):
     def test_irr_conf_layout(self):
         conf = irr.irr_conf([112, 62748], [], [], '2026-11-06T23:25:49Z')
         self.assertEqual(conf.splitlines()[:2], ['# Generated at 2026-11-06T23:25:49Z', ''])
-        self.assertIn('define ALL_ASNS = [\n  AS112,\n  AS62748\n];', conf)
+        self.assertIn('define ALL_ASNS = [\n  112,\n  62748\n];', conf)
         self.assertTrue(conf.index('ALL_ASNS') < conf.index('ALL_PREFIXES_V4') < conf.index('ALL_PREFIXES_V6'))
 
     def test_empty_result_is_not_published(self):

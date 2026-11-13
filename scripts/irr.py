@@ -17,7 +17,6 @@ import xml.etree.ElementTree as ET
 
 ASN = re.compile(r"AS([0-9]+)$")
 SET = re.compile(r"(?:AS[0-9]+:|AS-[A-Z0-9_-]+:)*AS-[A-Z0-9_-]+$")
-DEFAULT_MAX_ASNS = 100
 
 
 def validate_set(value):
@@ -37,21 +36,7 @@ def load_config(path):
     validate_set(cfg['full_set'])
     validate_set(cfg['customer_set'])
     validate_set(cfg['target_set'])
-    default = cfg.get('default_max_asns', DEFAULT_MAX_ASNS)
-    if isinstance(default, bool) or not isinstance(default, int) or default <= 0:
-        raise ValueError('default_max_asns must be a positive integer')
-    exceptions = cfg.get('exceptions', {})
-    if not isinstance(exceptions, dict):
-        raise ValueError('exceptions must map AS-SET names to limits')
-    for name, limit in exceptions.items():
-        validate_set(name)
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= default:
-            raise ValueError(f'Exception for {name} must exceed default_max_asns ({default})')
     return cfg
-
-
-def asn_limit(cfg, set_name):
-    return cfg.get('exceptions', {}).get(set_name, cfg.get('default_max_asns', DEFAULT_MAX_ASNS))
 
 
 def direct_members(cfg, set_name):
@@ -90,23 +75,16 @@ def bgpq(cfg, flags, objects):
     return values
 
 
-def select_asns(cfg, members, expand):
-    accepted, excluded, counts = set(), [], []
+def select_asns(members):
+    accepted, excluded = set(), []
     for member in sorted(set(members)):
         match = ASN.fullmatch(member)
-        if match:
-            accepted.add(validate_asns([int(match[1])])[0])
+        if not match:
+            validate_set(member)
+            excluded.append(f'{member} (AS-SET members are not allowed)')
             continue
-        validate_set(member)
-        # Only the child SET's own ASNs are counted; nested SETs are not expanded.
-        values = set(validate_asns(expand(member)))
-        limit = asn_limit(cfg, member)
-        counts.append((member, len(values), limit))
-        if len(values) <= limit:
-            accepted.update(values)
-        else:
-            excluded.append(f'{member} ({len(values)} ASNs, maximum {limit})')
-    return accepted, excluded, counts
+        accepted.add(validate_asns([int(match[1])])[0])
+    return accepted, excluded
 
 
 def own_asns(cfg):
@@ -183,8 +161,7 @@ def previous_counts(path):
 def generate(cfg, output):
     output.mkdir(parents=True, exist_ok=True)
     previous = previous_counts(output / 'result.txt')
-    customers, excluded, _ = select_asns(cfg, direct_members(cfg, cfg['customer_set']),
-                                         lambda member: bgpq(cfg, ['-t', '-L', '1'], [member]))
+    customers, excluded = select_asns(direct_members(cfg, cfg['customer_set']))
     if not customers:
         raise RuntimeError('No qualified customer ASNs; refusing to generate or publish an empty set')
     own = own_asns(cfg)
@@ -297,20 +274,13 @@ def upload(cfg, customer_asns, own):
     name = cfg['target_set']
     path = 'as-set/' + urllib.parse.quote(name, safe='')
     current = arin_request('GET', path, key)
-    if current is not None:
-        meta = parse_as_set(current, name)
-        org_handle = meta['org_handle'] or cfg['arin']['org_handle']
-        description, pocs, remarks = meta['description'], meta['pocs'], meta['remarks']
-    else:
-        arin = cfg['arin']
-        org_handle = arin['org_handle']
-        description = [arin['description']]
-        pocs = [('T', arin['tech_c']), ('AD', arin['admin_c'])]
-        remarks = []
-    payload = as_set_xml(name, org_handle, description, pocs, remarks, asns)
     if current is None:
-        path = 'as-set?' + urllib.parse.urlencode({'orgHandle': org_handle})
-    arin_request('PUT' if current is not None else 'POST', path, key, payload)
+        raise RuntimeError(f'{name} does not exist in ARIN; create it first')
+    # Only members change; description, POCs and remarks stay as they are in ARIN.
+    meta = parse_as_set(current, name)
+    payload = as_set_xml(name, meta['org_handle'], meta['description'],
+                         meta['pocs'], meta['remarks'], asns)
+    arin_request('PUT', path, key, payload)
     print(f"Synchronized {name} with {len(asns)} ASNs")
 
 

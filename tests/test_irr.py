@@ -22,30 +22,19 @@ class GenerationTests(unittest.TestCase):
     def setUp(self):
         self.cfg = irr.load_config(Path(__file__).resolve().parents[1] / 'config/irr.json')
 
-    def test_threshold_and_bounded_exception(self):
-        data = {'AS-EXACT': list(range(1, 101)), 'AS-LARGE': list(range(1, 102)),
-                'AS-MOEDOVE': list(range(1, 501))}
-        asns, excluded, counts = irr.select_asns(self.cfg, list(data), data.__getitem__)
-        self.assertEqual(len(asns), 500)
-        self.assertEqual(len(excluded), 1)
-        self.assertIn('AS-LARGE (101 ASNs, maximum 100)', excluded[0])
-        data['AS-MOEDOVE'].append(501)
-        asns, excluded, counts = irr.select_asns(self.cfg, list(data), data.__getitem__)
-        self.assertEqual(len(asns), 100)
-        self.assertEqual(len(excluded), 2)
-        self.assertEqual({name: (count, limit) for name, count, limit in counts},
-                         {'AS-EXACT': (100, 100), 'AS-LARGE': (101, 100), 'AS-MOEDOVE': (501, 500)})
+    def test_only_direct_asns_are_accepted(self):
+        members = ['AS112', 'AS150289', 'AS-CHILD', 'AS150289:AS-CUST']
+        asns, excluded = irr.select_asns(members)
+        self.assertEqual(asns, {112, 150289})
+        self.assertEqual(excluded, ['AS-CHILD (AS-SET members are not allowed)',
+                                    'AS150289:AS-CUST (AS-SET members are not allowed)'])
 
-    def test_customer_depth_is_one_and_own_set_is_excluded_from_upload(self):
+    def test_customer_set_yields_only_direct_asns(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
 
             def bgpq(cfg, flags, objects):
-                if '-t' in flags:
-                    self.assertEqual(flags, ['-t', '-L', '1'])
-                    self.assertEqual(objects, ['AS-CHILD'])
-                    return [150289]
-                self.assertEqual(objects, ['AS112', 'AS62748', 'AS150289'])
+                self.assertEqual(objects, ['AS112', 'AS62748'])
                 self.assertNotIn('-A', flags)
                 return [{'prefix': '192.0.2.0/24', 'exact': True}] if '-4' in flags else []
 
@@ -57,14 +46,14 @@ class GenerationTests(unittest.TestCase):
                 irr.generate(self.cfg, output)
 
             conf = (output / 'irr.conf').read_text()
-            self.assertIn('define ALL_ASNS = [\n  112,\n  62748,\n  150289\n];', conf)
+            self.assertIn('define ALL_ASNS = [\n  112,\n  62748\n];', conf)
             self.assertIn('define ALL_PREFIXES_V6 = [];', conf)
 
             report = (output / 'result.txt').read_text()
-            self.assertIn('ASNs: 3 (+0)', report)
+            self.assertIn('ASNs: 2 (+0)', report)
             self.assertIn('IPv4 Prefixes: 1 (+0)', report)
             self.assertIn('IPv6 Prefixes: 0 (+0)', report)
-            self.assertIn('Excluded AS-SET:\n  none', report)
+            self.assertIn('Excluded AS-SET:\n  AS-CHILD (AS-SET members are not allowed)', report)
             self.assertEqual(sorted(p.name for p in output.iterdir()), ['irr.conf', 'result.txt'])
 
     def test_result_report_delta_and_round_trip(self):
@@ -128,46 +117,6 @@ class GenerationTests(unittest.TestCase):
         self.assertNotIn(b'AS62748', payload)
         self.assertNotIn(b'name="AS-CATHRIX"', payload)
 
-    def test_default_max_asns_is_configurable(self):
-        cfg = dict(self.cfg, default_max_asns=5, exceptions={})
-        data = {'AS-SMALL': [1, 2, 3, 4, 5], 'AS-BIG': [1, 2, 3, 4, 5, 6]}
-        asns, excluded, _ = irr.select_asns(cfg, list(data), data.__getitem__)
-        self.assertEqual(len(asns), 5)
-        self.assertEqual(excluded, ['AS-BIG (6 ASNs, maximum 5)'])
-
-    def test_exception_must_exceed_default(self):
-        cfg = dict(self.cfg, default_max_asns=500, exceptions={'AS-MOEDOVE': 500})
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'cfg.json'
-            path.write_text(json.dumps(cfg))
-            with self.assertRaises(ValueError):
-                irr.load_config(path)
-
-    def test_invalid_default_max_asns_is_rejected(self):
-        for bad in (0, -1, '100', 100.5, True, None):
-            cfg = dict(self.cfg, default_max_asns=bad)
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / 'cfg.json'
-                path.write_text(json.dumps(cfg))
-                with self.assertRaises(ValueError, msg=f'{bad!r} should be rejected'):
-                    irr.load_config(path)
-
-    def test_default_max_asns_bounds_every_set(self):
-        cfg = dict(self.cfg, default_max_asns=5, exceptions={})
-        data = {'AS-FIVE': [1, 2, 3, 4, 5], 'AS-SIX': [1, 2, 3, 4, 5, 6]}
-        asns, excluded, counts = irr.select_asns(cfg, list(data), data.__getitem__)
-        self.assertEqual(len(asns), 5)
-        self.assertEqual(excluded, ['AS-SIX (6 ASNs, maximum 5)'])
-        self.assertEqual(irr.asn_limit(cfg, 'AS-UNLISTED'), 5)
-
-    def test_exception_overrides_default(self):
-        cfg = dict(self.cfg, default_max_asns=5, exceptions={'AS-BIG': 10})
-        data = {'AS-BIG': list(range(1, 11)), 'AS-MID': list(range(1, 7))}
-        asns, excluded, _ = irr.select_asns(cfg, list(data), data.__getitem__)
-        self.assertEqual(len(asns), 10)
-        self.assertEqual(excluded, ['AS-MID (6 ASNs, maximum 5)'])
-        self.assertEqual(irr.asn_limit(cfg, 'AS-BIG'), 10)
-
     def _run_sync(self, publish):
         def bgpq(cfg, flags, objects):
             if '-t' in flags:
@@ -221,13 +170,12 @@ class GenerationTests(unittest.TestCase):
             api.assert_not_called()
         self.assertIn('AS62748', str(caught.exception))
 
-    def test_create_endpoint(self):
+    def test_missing_object_is_not_created(self):
         with patch.dict(irr.os.environ, {'ARIN_API_KEY': 'test'}), \
-                patch.object(irr, 'arin_request', side_effect=[None, 'ok']) as api:
-            irr.upload(self.cfg, {112}, {62748})
-        self.assertEqual(api.call_args.args[:2], ('POST', 'as-set?orgHandle=CN-578'))
-        payload = api.call_args.args[3]
-        self.assertIn(b'<member name="AS112"', payload)
+                patch.object(irr, 'arin_request', side_effect=[None]) as api:
+            with self.assertRaises(RuntimeError):
+                irr.upload(self.cfg, {112}, {62748})
+        self.assertEqual(api.call_count, 1)
 
     def test_arin_uses_xml_media_type(self):
         seen = {}

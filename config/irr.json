@@ -3,15 +3,5 @@
   "customer_set": "AS-CATHRIX-CUST",
   "target_set": "AS-CR",
   "irr_host": "rr.ntt.net",
-  "irr_port": 43,
-  "default_max_asns": 100,
-  "exceptions": {
-    "AS-MOEDOVE": 500
-  },
-  "arin": {
-    "org_handle": "CN-578",
-    "admin_c": "CNOC24-ARIN",
-    "tech_c": "CNOC24-ARIN",
-    "description": "Expanded from AS-CATHRIX-CUST"
-  }
+  "irr_port": 43
 }

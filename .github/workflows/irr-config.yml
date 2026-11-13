@@ -2,7 +2,7 @@ name: IRR Config Generation
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '47 22 * * *'
   workflow_dispatch:
   push:
     paths: [ 'config/**', 'scripts/**', 'tests/**', '.github/workflows/irr-config.yml' ]

@@ -5,7 +5,7 @@ Generates customer ASNs and BIRD prefix configuration from `AS-CATHRIX-CUST`, an
 ## Algorithm
 
 1. Read the direct members of `AS-CATHRIX-CUST`.
-2. Keep only direct ASNs. Any AS-SET member is rejected, so customers cannot bring downstream sets.
+2. Keep only direct ASNs.
 3. Read the own members of `AS-CATHRIX`, skip `AS-CR`, and merge them with the customer ASNs.
 4. Look up exact prefixes for the merged ASNs.
 5. Write `irr.conf` and `result.txt`, then publish the customer ASNs to `AS-CR`.
@@ -27,8 +27,6 @@ Environment variables:
 | Variable       | Description                           |
 |----------------|---------------------------------------|
 | `ARIN_API_KEY` | ARIN API key, required for publishing |
-
-GitHub Secret: `ARIN_API_KEY`.
 
 ## Commands
 

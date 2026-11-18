@@ -22,39 +22,59 @@ class GenerationTests(unittest.TestCase):
     def setUp(self):
         self.cfg = irr.load_config(Path(__file__).resolve().parents[1] / 'config/irr.json')
 
-    def test_only_direct_asns_are_accepted(self):
+    def test_deeper_sets_are_excluded(self):
         members = ['AS112', 'AS150289', 'AS-CHILD', 'AS150289:AS-CUST']
         asns, excluded = irr.select_asns(members)
         self.assertEqual(asns, {112, 150289})
-        self.assertEqual(excluded, ['AS-CHILD (AS-SET members are not allowed)',
-                                    'AS150289:AS-CUST (AS-SET members are not allowed)'])
+        self.assertEqual(excluded, ['AS-CHILD (maximum AS-SET expansion depth reached)',
+                                    'AS150289:AS-CUST (maximum AS-SET expansion depth reached)'])
 
-    def test_customer_set_yields_only_direct_asns(self):
+    def test_customer_set_expands_one_level(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
 
             def bgpq(cfg, flags, objects):
-                self.assertEqual(objects, ['AS112', 'AS62748'])
+                self.assertEqual(objects, ['AS112', 'AS62748', 'AS150289'])
                 self.assertNotIn('-A', flags)
                 return [{'prefix': '192.0.2.0/24', 'exact': True}] if '-4' in flags else []
 
             stub = members_by_set({
                 self.cfg['customer_set']: ['AS112', 'AS-CHILD'],
+                'AS-CHILD': ['AS150289', 'AS-DEEPER'],
                 self.cfg['full_set']: ['AS62748', self.cfg['target_set']],
             })
-            with patch.object(irr, 'direct_members', side_effect=stub), patch.object(irr, 'bgpq', side_effect=bgpq):
-                irr.generate(self.cfg, output)
+            with patch.object(irr, 'direct_members', side_effect=stub) as query, patch.object(irr, 'bgpq', side_effect=bgpq):
+                state = irr.generate(self.cfg, output)
+            self.assertEqual(state['customers'], {112, 150289})
+            self.assertEqual([call.args[1] for call in query.call_args_list],
+                             [self.cfg['customer_set'], 'AS-CHILD', self.cfg['full_set']])
 
             conf = (output / 'irr.conf').read_text()
-            self.assertIn('define ALL_ASNS = [\n  112,\n  62748\n];', conf)
+            self.assertIn('define ALL_ASNS = [\n  112,\n  62748,\n  150289\n];', conf)
             self.assertIn('define ALL_PREFIXES_V6 = [];', conf)
 
             report = (output / 'result.txt').read_text()
-            self.assertIn('ASNs: 2 (+0)', report)
+            self.assertIn('ASNs: 3 (+0)', report)
             self.assertIn('IPv4 Prefixes: 1 (+0)', report)
             self.assertIn('IPv6 Prefixes: 0 (+0)', report)
-            self.assertIn('Excluded AS-SET:\n  AS-CHILD (AS-SET members are not allowed)', report)
+            self.assertIn('Excluded AS-SET:\n  AS-DEEPER (maximum AS-SET expansion depth reached) [in AS-CHILD]', report)
             self.assertEqual(sorted(p.name for p in output.iterdir()), ['irr.conf', 'result.txt'])
+
+    def test_customer_sets_deduplicate_asns_and_stop_cycles(self):
+        stub = members_by_set({
+            self.cfg['customer_set']: ['AS112', 'AS-CHILD', 'AS-CHILD', 'AS150289:AS-CUST'],
+            'AS-CHILD': ['AS112', 'AS150289', self.cfg['customer_set']],
+            'AS150289:AS-CUST': ['AS150289', 'AS-CHILD'],
+        })
+        with patch.object(irr, 'direct_members', side_effect=stub) as query:
+            asns, excluded = irr.customer_asns(self.cfg)
+        self.assertEqual(asns, {112, 150289})
+        self.assertEqual([call.args[1] for call in query.call_args_list],
+                         [self.cfg['customer_set'], 'AS-CHILD', 'AS150289:AS-CUST'])
+        self.assertEqual(excluded, [
+            'AS-CATHRIX-CUST (maximum AS-SET expansion depth reached) [in AS-CHILD]',
+            'AS-CHILD (maximum AS-SET expansion depth reached) [in AS150289:AS-CUST]',
+        ])
 
     def test_result_report_delta_and_round_trip(self):
         previous = {'asns': 320, 'v4': 1500, 'v6': 9231}
@@ -124,7 +144,8 @@ class GenerationTests(unittest.TestCase):
             return [{'prefix': '192.0.2.0/24', 'exact': True}] if '-4' in flags else []
 
         stub = members_by_set({
-            self.cfg['customer_set']: ['AS112'],
+            self.cfg['customer_set']: ['AS-CHILD'],
+            'AS-CHILD': ['AS112', 'AS-DEEPER'],
             self.cfg['full_set']: ['AS62748', self.cfg['target_set']],
         })
         with tempfile.TemporaryDirectory() as directory, \

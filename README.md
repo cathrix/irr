@@ -5,7 +5,7 @@ Generates customer ASNs and BIRD prefix configuration from `AS-CATHRIX-CUST`, an
 ## Algorithm
 
 1. Read the direct members of `AS-CATHRIX-CUST`.
-2. Keep only direct ASNs.
+2. Keep direct ASNs and query the direct members of each immediate child AS-SET. Keep the child sets' ASNs, but do not query deeper AS-SETs; report those exclusions with their parent set. Deduplicate the collected customer ASNs.
 3. Read the own members of `AS-CATHRIX`, skip `AS-CR`, and merge them with the customer ASNs.
 4. Look up exact prefixes for the merged ASNs.
 5. Write `irr.conf` and `result.txt`, then publish the customer ASNs to `AS-CR`.

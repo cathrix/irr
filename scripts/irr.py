@@ -81,10 +81,23 @@ def select_asns(members):
         match = ASN.fullmatch(member)
         if not match:
             validate_set(member)
-            excluded.append(f'{member} (AS-SET members are not allowed)')
+            excluded.append(f'{member} (maximum AS-SET expansion depth reached)')
             continue
         accepted.add(validate_asns([int(match[1])])[0])
     return accepted, excluded
+
+
+def customer_asns(cfg):
+    members = direct_members(cfg, cfg['customer_set'])
+    asns, _ = select_asns(members)
+    excluded = []
+    for member in sorted(set(members)):
+        if ASN.fullmatch(member):
+            continue
+        child_asns, child_excluded = select_asns(direct_members(cfg, member))
+        asns.update(child_asns)
+        excluded.extend(f'{item} [in {member}]' for item in child_excluded)
+    return asns, excluded
 
 
 def own_asns(cfg):
@@ -161,7 +174,7 @@ def previous_counts(path):
 def generate(cfg, output):
     output.mkdir(parents=True, exist_ok=True)
     previous = previous_counts(output / 'result.txt')
-    customers, excluded = select_asns(direct_members(cfg, cfg['customer_set']))
+    customers, excluded = customer_asns(cfg)
     if not customers:
         raise RuntimeError('No qualified customer ASNs; refusing to generate or publish an empty set')
     own = own_asns(cfg)

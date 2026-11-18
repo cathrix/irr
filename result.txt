@@ -1,8 +1,8 @@
-Generated at 2026-11-17T18:03:19Z
+Generated at 2026-11-18T03:54:28Z
 
-ASNs: 8 (+1)
-IPv4 Prefixes: 10 (+1)
-IPv6 Prefixes: 859 (+38)
+ASNs: 8 (+0)
+IPv4 Prefixes: 11 (+1)
+IPv6 Prefixes: 859 (+0)
 
 Excluded AS-SET:
   none
